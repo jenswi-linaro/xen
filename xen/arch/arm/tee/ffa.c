@@ -148,6 +148,15 @@ struct ffa_ctx {
 /* Negotiated FF-A version to use with the SPMC */
 static uint32_t ffa_version __ro_after_init;
 
+/*
+ * Our rx/tx buffers shared with the SPMC.
+ *
+ * ffa_page_count is the number of pages used in each of these buffers.
+ */
+static void *ffa_rx __read_mostly;
+static void *ffa_tx __read_mostly;
+static unsigned int ffa_page_count __read_mostly;
+
 static bool ffa_get_version(uint32_t *vers)
 {
     const struct arm_smccc_1_2_regs arg = {
@@ -215,6 +224,17 @@ static bool check_mandatory_feature(uint32_t id)
         printk(XENLOG_ERR "ffa: mandatory feature id %#x missing\n", id);
 
     return !ret;
+}
+
+static int32_t ffa_rxtx_map(register_t tx_addr, register_t rx_addr,
+                            uint32_t page_count)
+{
+    uint32_t fid = FFA_RXTX_MAP_32;
+
+    if ( IS_ENABLED(CONFIG_ARM_64) )
+        fid = FFA_RXTX_MAP_64;
+
+    return ffa_simple_call(fid, tx_addr, rx_addr, page_count, 0);
 }
 
 static uint16_t get_vm_id(const struct domain *d)
@@ -384,6 +404,7 @@ static int ffa_relinquish_resources(struct domain *d)
 static bool ffa_probe(void)
 {
     uint32_t vers;
+    int e;
     unsigned int major_vers;
     unsigned int minor_vers;
 
@@ -426,12 +447,46 @@ static bool ffa_probe(void)
     printk(XENLOG_INFO "ARM FF-A Firmware version %u.%u\n",
            major_vers, minor_vers);
 
-    if ( !check_mandatory_feature(FFA_MSG_SEND_DIRECT_REQ_32) )
+    if (
+#ifdef CONFIG_ARM_64
+         !check_mandatory_feature(FFA_RXTX_MAP_64) ||
+#endif
+#ifdef CONFIG_ARM_32
+         !check_mandatory_feature(FFA_RXTX_MAP_32) ||
+#endif
+         !check_mandatory_feature(FFA_RXTX_UNMAP) ||
+         !check_mandatory_feature(FFA_MSG_SEND_DIRECT_REQ_32) )
         return false;
 
+    ffa_rx = alloc_xenheap_pages(0, 0);
+    if ( !ffa_rx )
+        return false;
+
+    ffa_tx = alloc_xenheap_pages(0, 0);
+    if ( !ffa_tx )
+        goto err_free_ffa_rx;
+
+    e = ffa_rxtx_map(__pa(ffa_tx), __pa(ffa_rx), 1);
+    if ( e )
+    {
+        printk(XENLOG_ERR "ffa: Failed to map rxtx: error %d\n", e);
+        goto err_free_ffa_tx;
+    }
+    ffa_page_count = 1;
     ffa_version = vers;
 
     return true;
+
+err_free_ffa_tx:
+    free_xenheap_pages(ffa_tx, 0);
+    ffa_tx = NULL;
+err_free_ffa_rx:
+    free_xenheap_pages(ffa_rx, 0);
+    ffa_rx = NULL;
+    ffa_page_count = 0;
+    ffa_version = 0;
+
+    return false;
 }
 
 static const struct tee_mediator_ops ffa_ops =
