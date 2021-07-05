@@ -142,6 +142,7 @@
 
 struct ffa_ctx {
     uint32_t guest_vers;
+    bool interrupted;
 };
 
 /* Negotiated FF-A version to use with the SPMC */
@@ -165,6 +166,55 @@ static bool ffa_get_version(uint32_t *vers)
     *vers = resp.a0;
 
     return true;
+}
+
+static int32_t get_ffa_ret_code(const struct arm_smccc_1_2_regs *resp)
+{
+    switch ( resp->a0 )
+    {
+    case FFA_ERROR:
+        if ( resp->a2 )
+            return resp->a2;
+        else
+            return FFA_RET_NOT_SUPPORTED;
+    case FFA_SUCCESS_32:
+    case FFA_SUCCESS_64:
+        return FFA_RET_OK;
+    default:
+        return FFA_RET_NOT_SUPPORTED;
+    }
+}
+
+static int32_t ffa_simple_call(uint32_t fid, register_t a1, register_t a2,
+                               register_t a3, register_t a4)
+{
+    const struct arm_smccc_1_2_regs arg = {
+        .a0 = fid,
+        .a1 = a1,
+        .a2 = a2,
+        .a3 = a3,
+        .a4 = a4,
+    };
+    struct arm_smccc_1_2_regs resp;
+
+    arm_smccc_1_2_smc(&arg, &resp);
+
+    return get_ffa_ret_code(&resp);
+}
+
+static int32_t ffa_features(uint32_t id)
+{
+    return ffa_simple_call(FFA_FEATURES, id, 0, 0, 0);
+}
+
+static bool check_mandatory_feature(uint32_t id)
+{
+    uint32_t ret = ffa_features(id);
+
+    if (ret)
+        printk(XENLOG_ERR "ffa: mandatory feature id %#x missing\n", id);
+
+    return !ret;
 }
 
 static uint16_t get_vm_id(const struct domain *d)
@@ -208,6 +258,66 @@ static void handle_version(struct cpu_user_regs *regs)
     set_regs(regs, vers, 0, 0, 0, 0, 0, 0, 0);
 }
 
+static void handle_msg_send_direct_req(struct cpu_user_regs *regs, uint32_t fid)
+{
+    struct arm_smccc_1_2_regs arg = { .a0 = fid, };
+    struct arm_smccc_1_2_regs resp = { };
+    struct domain *d = current->domain;
+    struct ffa_ctx *ctx = d->arch.tee;
+    uint32_t src_dst;
+    uint64_t mask;
+
+    if ( smccc_is_conv_64(fid) )
+        mask = GENMASK_ULL(63, 0);
+    else
+        mask = GENMASK_ULL(31, 0);
+
+    src_dst = get_user_reg(regs, 1);
+    if ( (src_dst >> 16) != get_vm_id(d) )
+    {
+        resp.a0 = FFA_ERROR;
+        resp.a2 = FFA_RET_INVALID_PARAMETERS;
+        goto out;
+    }
+
+    arg.a1 = src_dst;
+    arg.a2 = get_user_reg(regs, 2) & mask;
+    arg.a3 = get_user_reg(regs, 3) & mask;
+    arg.a4 = get_user_reg(regs, 4) & mask;
+    arg.a5 = get_user_reg(regs, 5) & mask;
+    arg.a6 = get_user_reg(regs, 6) & mask;
+    arg.a7 = get_user_reg(regs, 7) & mask;
+
+    while ( true )
+    {
+        arm_smccc_1_2_smc(&arg, &resp);
+
+        switch ( resp.a0 )
+        {
+        case FFA_INTERRUPT:
+            ctx->interrupted = true;
+            goto out;
+        case FFA_ERROR:
+        case FFA_SUCCESS_32:
+        case FFA_SUCCESS_64:
+        case FFA_MSG_SEND_DIRECT_RESP_32:
+        case FFA_MSG_SEND_DIRECT_RESP_64:
+            goto out;
+        default:
+            /* Bad fid, report back. */
+            memset(&arg, 0, sizeof(arg));
+            arg.a0 = FFA_ERROR;
+            arg.a1 = src_dst;
+            arg.a2 = FFA_RET_NOT_SUPPORTED;
+            continue;
+        }
+    }
+
+out:
+    set_regs(regs, resp.a0, resp.a1 & mask, resp.a2 & mask, resp.a3 & mask,
+             resp.a4 & mask, resp.a5 & mask, resp.a6 & mask, resp.a7 & mask);
+}
+
 static bool ffa_handle_call(struct cpu_user_regs *regs)
 {
     uint32_t fid = get_user_reg(regs, 0);
@@ -224,6 +334,12 @@ static bool ffa_handle_call(struct cpu_user_regs *regs)
         return true;
     case FFA_ID_GET:
         set_regs_success(regs, get_vm_id(d), 0);
+        return true;
+    case FFA_MSG_SEND_DIRECT_REQ_32:
+#ifdef CONFIG_ARM_64
+    case FFA_MSG_SEND_DIRECT_REQ_64:
+#endif
+        handle_msg_send_direct_req(regs, fid);
         return true;
 
     default:
@@ -309,6 +425,9 @@ static bool ffa_probe(void)
            FFA_MY_VERSION_MAJOR, FFA_MY_VERSION_MINOR);
     printk(XENLOG_INFO "ARM FF-A Firmware version %u.%u\n",
            major_vers, minor_vers);
+
+    if ( !check_mandatory_feature(FFA_MSG_SEND_DIRECT_REQ_32) )
+        return false;
 
     ffa_version = vers;
 
