@@ -110,7 +110,7 @@ struct arch_domain
     struct vpl011 vpl011;
 #endif
 
-#ifdef CONFIG_TEE
+#if defined(CONFIG_TEE) || defined(CONFIG_FFA)
     void *tee;
 #endif
 
