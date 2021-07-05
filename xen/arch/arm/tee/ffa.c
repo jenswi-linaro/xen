@@ -141,6 +141,12 @@
 #define FFA_MSG_POLL                    0x8400006AU
 
 /* Partition information descriptor */
+struct ffa_partition_info_1_0 {
+    uint16_t id;
+    uint16_t execution_context;
+    uint32_t partition_properties;
+};
+
 struct ffa_partition_info_1_1 {
     uint16_t id;
     uint16_t execution_context;
@@ -157,9 +163,8 @@ struct ffa_ctx {
     uint32_t guest_vers;
     bool tx_is_mine;
     bool interrupted;
+    spinlock_t lock;
 };
-
-
 /* Negotiated FF-A version to use with the SPMC */
 static uint32_t ffa_version __ro_after_init;
 
@@ -173,10 +178,16 @@ static unsigned int subscr_vm_destroyed_count __read_mostly;
  * Our rx/tx buffers shared with the SPMC.
  *
  * ffa_page_count is the number of pages used in each of these buffers.
+ *
+ * The RX buffer is protected from concurrent usage with ffa_rx_buffer_lock.
+ * Note that the SPMC is also tracking the ownership of our RX buffer so
+ * for calls which uses our RX buffer to deliver a result we must call
+ * ffa_rx_release() to let the SPMC know that we're done with the buffer.
  */
 static void *ffa_rx __read_mostly;
 static void *ffa_tx __read_mostly;
 static unsigned int ffa_page_count __read_mostly;
+static DEFINE_SPINLOCK(ffa_rx_buffer_lock);
 
 static bool ffa_get_version(uint32_t *vers)
 {
@@ -463,6 +474,98 @@ static uint32_t handle_rxtx_unmap(void)
     return FFA_RET_OK;
 }
 
+static uint32_t handle_partition_info_get(uint32_t w1, uint32_t w2, uint32_t w3,
+                                          uint32_t w4, uint32_t w5,
+                                          uint32_t *count)
+{
+    bool query_count_only = w5 & FFA_PARTITION_INFO_GET_COUNT_FLAG;
+    uint32_t w5_mask = 0;
+    uint32_t ret = FFA_RET_DENIED;
+    struct domain *d = current->domain;
+    struct ffa_ctx *ctx = d->arch.tee;
+
+    /*
+     * FF-A v1.0 has w5 MBZ while v1.1 allows
+     * FFA_PARTITION_INFO_GET_COUNT_FLAG to be non-zero.
+     */
+    if ( ctx->guest_vers == FFA_VERSION_1_1 )
+        w5_mask = FFA_PARTITION_INFO_GET_COUNT_FLAG;
+    if ( w5 & ~w5_mask )
+        return FFA_RET_INVALID_PARAMETERS;
+
+    if ( query_count_only )
+        return ffa_partition_info_get(w1, w2, w3, w4, w5, count);
+
+    if ( !ffa_page_count )
+        return FFA_RET_DENIED;
+
+    spin_lock(&ctx->lock);
+    spin_lock(&ffa_rx_buffer_lock);
+    if ( !ctx->page_count || !ctx->tx_is_mine )
+        goto out;
+    ret = ffa_partition_info_get(w1, w2, w3, w4, w5, count);
+    if ( ret )
+        goto out;
+
+    if ( ctx->guest_vers == FFA_VERSION_1_0 )
+    {
+        size_t n;
+        struct ffa_partition_info_1_1 *src = ffa_rx;
+        struct ffa_partition_info_1_0 *dst = ctx->rx;
+
+        if ( ctx->page_count * FFA_PAGE_SIZE < *count * sizeof(*dst) )
+        {
+            ret = FFA_RET_NO_MEMORY;
+            goto out_rx_release;
+        }
+
+        for ( n = 0; n < *count; n++ )
+        {
+            dst[n].id = src[n].id;
+            dst[n].execution_context = src[n].execution_context;
+            dst[n].partition_properties = src[n].partition_properties;
+        }
+    }
+    else
+    {
+        size_t sz = *count * sizeof(struct ffa_partition_info_1_1);
+
+        if ( ctx->page_count * FFA_PAGE_SIZE < sz )
+        {
+            ret = FFA_RET_NO_MEMORY;
+            goto out_rx_release;
+        }
+
+
+        memcpy(ctx->rx, ffa_rx, sz);
+    }
+    ctx->tx_is_mine = false;
+out_rx_release:
+    ffa_rx_release();
+out:
+    spin_unlock(&ffa_rx_buffer_lock);
+    spin_unlock(&ctx->lock);
+
+    return ret;
+}
+
+static uint32_t handle_rx_release(void)
+{
+    uint32_t ret = FFA_RET_DENIED;
+    struct domain *d = current->domain;
+    struct ffa_ctx *ctx = d->arch.tee;
+
+    spin_lock(&ctx->lock);
+    if ( !ctx->page_count || ctx->tx_is_mine )
+        goto out;
+    ret = FFA_RET_OK;
+    ctx->tx_is_mine = true;
+out:
+    spin_unlock(&ctx->lock);
+
+    return ret;
+}
+
 static void handle_msg_send_direct_req(struct cpu_user_regs *regs, uint32_t fid)
 {
     struct arm_smccc_1_2_regs arg = { .a0 = fid, };
@@ -528,6 +631,7 @@ static bool ffa_handle_call(struct cpu_user_regs *regs)
     uint32_t fid = get_user_reg(regs, 0);
     struct domain *d = current->domain;
     struct ffa_ctx *ctx = d->arch.tee;
+    uint32_t count;
     int e;
 
     if ( !ctx )
@@ -554,6 +658,24 @@ static bool ffa_handle_call(struct cpu_user_regs *regs)
         return true;
     case FFA_RXTX_UNMAP:
         e = handle_rxtx_unmap();
+        if ( e )
+            set_regs_error(regs, e);
+        else
+            set_regs_success(regs, 0, 0);
+        return true;
+    case FFA_PARTITION_INFO_GET:
+        e = handle_partition_info_get(get_user_reg(regs, 1),
+                                      get_user_reg(regs, 2),
+                                      get_user_reg(regs, 3),
+                                      get_user_reg(regs, 4),
+                                      get_user_reg(regs, 5), &count);
+        if ( e )
+            set_regs_error(regs, e);
+        else
+            set_regs_success(regs, count, 0);
+        return true;
+    case FFA_RX_RELEASE:
+        e = handle_rx_release();
         if ( e )
             set_regs_error(regs, e);
         else
