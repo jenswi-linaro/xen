@@ -22,6 +22,14 @@
 #include <asm/tee/ffa.h>
 #include <asm/regs.h>
 
+/*
+ * References:
+ * FF-A-1.0-REL: FF-A specification version 1.0 available at
+ *               https://developer.arm.com/documentation/den0077/a
+ * FF-A-1.1-REL0: FF-A specification version 1.1 available at
+ *                https://developer.arm.com/documentation/den0077/e
+ */
+
 /* Error codes */
 #define FFA_RET_OK                      0
 #define FFA_RET_NOT_SUPPORTED           -1
@@ -65,6 +73,55 @@
  * specification.
  */
 #define FFA_PAGE_SIZE                   SZ_4K
+
+/*
+ * Limit for shared buffer size. Please note that this define limits
+ * number of pages. But user buffer can be not aligned to a page
+ * boundary. So it is possible that user would not be able to share
+ * exactly FFA_MAX_SHM_BUFFER_PG * FFA_PAGE_SIZE bytes.
+ *
+ * FF-A doesn't have any direct requirments on GlobalPlatform or vice
+ * versa, but an implementation can very well use FF-A in order to provide
+ * a GlobalPlatform interface on top.
+ *
+ * Global Platform specification for TEE requires that any TEE
+ * implementation should allow to share buffers with size of at least
+ * 512KB. Due to align issue mentioned above, we need to increase this
+ * value with one.
+ */
+#define FFA_MAX_SHM_PAGE_COUNT          (SZ_512K / FFA_PAGE_SIZE + 1)
+
+/*
+ * Limits the number of shared buffers that guest can have at once. This
+ * is to prevent case, when guests tricks XEN into exhausting its own
+ * memory by allocating many small buffers. This value has been chosen
+ * arbitrary.
+ */
+#define FFA_MAX_SHM_COUNT               32
+
+/* FF-A-1.1-REL0 section 10.9.2 Memory region handle, page 167 */
+#define FFA_HANDLE_HYP_FLAG             BIT(63, ULL)
+#define FFA_HANDLE_INVALID              0xffffffffffffffffULL
+
+/*
+ * The bits for FFA_NORMAL_MEM_REG_ATTR FFA_MEM_ACC_RW below are
+ * defined in FF-A-1.1-REL0 Table 10.18 at page 175.
+ */
+ /* Memory attributes: Normal memory, Write-Back cacheable, Inner shareable */
+#define FFA_NORMAL_MEM_REG_ATTR         0x2fU
+/* Memory access permissions: Read-write */
+#define FFA_MEM_ACC_RW                  0x2U
+
+/* FF-A-1.1-REL0 section 10.11.4 Flags usage, page 184-187 */
+/* Clear memory before mapping in receiver */
+#define FFA_MEMORY_REGION_FLAG_CLEAR            BIT(0, U)
+/* Relayer may time slice this operation */
+#define FFA_MEMORY_REGION_FLAG_TIME_SLICE       BIT(1, U)
+/* Clear memory after receiver relinquishes it */
+#define FFA_MEMORY_REGION_FLAG_CLEAR_RELINQUISH BIT(2, U)
+/* Share memory transaction */
+#define FFA_MEMORY_REGION_TRANSACTION_TYPE_SHARE (1U << 3)
+
 
 /* Framework direct request/response */
 #define FFA_MSG_FLAG_FRAMEWORK          BIT(31, U)
