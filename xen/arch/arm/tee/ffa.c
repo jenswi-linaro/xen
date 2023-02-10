@@ -326,6 +326,7 @@ struct ffa_ctx {
     uint32_t guest_vers;
     bool tx_is_mine;
     bool interrupted;
+    struct list_head frag_list;
     struct list_head shm_list;
     unsigned int shm_count;
     spinlock_t lock;
@@ -338,6 +339,18 @@ struct ffa_shm_mem {
     uint64_t handle;    /* FFA_HANDLE_INVALID if not set yet */
     unsigned int page_count;
     struct page_info *pages[];
+};
+
+struct mem_frag_state {
+    struct list_head list;
+    struct ffa_shm_mem *shm;
+    uint32_t range_count;
+    unsigned int current_page_idx;
+    unsigned int frag_offset;
+    unsigned int range_offset;
+    const uint8_t *buf;
+    unsigned int buf_size;
+    struct ffa_address_range range;
 };
 
 /* Negotiated FF-A version to use with the SPMC */
@@ -512,6 +525,36 @@ static int32_t ffa_mem_share(uint32_t tot_len, uint32_t frag_len,
     }
 }
 
+static int32_t ffa_mem_frag_tx(uint64_t handle, uint32_t frag_len,
+                               uint16_t sender_id)
+{
+    struct arm_smccc_1_2_regs arg = {
+        .a0 = FFA_MEM_FRAG_TX,
+        .a1 = handle & UINT32_MAX,
+        .a2 = handle >> 32,
+        .a3 = frag_len,
+        .a4 = (uint32_t)sender_id << 16,
+    };
+    struct arm_smccc_1_2_regs resp;
+
+    arm_smccc_1_2_smc(&arg, &resp);
+
+    switch ( resp.a0 )
+    {
+    case FFA_ERROR:
+        if ( resp.a2 )
+            return resp.a2;
+        else
+            return FFA_RET_NOT_SUPPORTED;
+    case FFA_SUCCESS_32:
+        return FFA_RET_OK;
+    case FFA_MEM_FRAG_RX:
+        return resp.a3;
+    default:
+            return FFA_RET_NOT_SUPPORTED;
+    }
+}
+
 static int32_t ffa_mem_reclaim(uint32_t handle_lo, uint32_t handle_hi,
                                uint32_t flags)
 {
@@ -584,6 +627,14 @@ static void set_regs_success(struct cpu_user_regs *regs, uint32_t w2,
                              uint32_t w3)
 {
     set_regs(regs, FFA_SUCCESS_32, 0, w2, w3, 0, 0, 0, 0);
+}
+
+static void set_regs_frag_rx(struct cpu_user_regs *regs, uint32_t handle_lo,
+                             uint32_t handle_hi, uint32_t frag_offset,
+                             uint16_t sender_id)
+{
+    set_regs(regs, FFA_MEM_FRAG_RX, handle_lo, handle_hi, frag_offset,
+             (uint32_t)sender_id << 16, 0, 0, 0);
 }
 
 static void handle_version(struct cpu_user_regs *regs)
@@ -955,6 +1006,8 @@ static int share_shm(struct ffa_shm_mem *shm)
     paddr_t last_pa;
     unsigned int n;
     paddr_t pa;
+    bool first;
+    int ret;
 
     ASSERT(spin_is_locked(&ffa_tx_buffer_lock));
     if ( !shm->page_count )
@@ -994,13 +1047,23 @@ static int share_shm(struct ffa_shm_mem *shm)
 
     tot_len = ADDR_RANGE_OFFSET(descr->mem_access_count, region_count,
                                 region_descr->address_range_count);
-    if ( tot_len > max_frag_len )
-        return FFA_RET_NOT_SUPPORTED;
 
+    /*
+     * Sharing memory with secure world may have to be done with multiple
+     * calls depending on how many address ranges will be needed. If we're
+     * sharing physically contiguous memory we will only need one range but
+     * we will also need to deal with the worst case where all physical
+     * pages are non-contiguous. For the first batch of address ranges we
+     * call ffa_mem_share() and for all that follows ffa_mem_frag_tx().
+     *
+     * We use frag_len to keep track of how far into the transmit buffer we
+     * have gone.
+     */
     addr_range = region_descr->address_range_array;
     frag_len = ADDR_RANGE_OFFSET(descr->mem_access_count, region_count, 1);
     last_pa = page_to_maddr(shm->pages[0]);
     init_range(addr_range, last_pa);
+    first = true;
     for ( n = 1; n < shm->page_count; last_pa = pa, n++ )
     {
         pa = page_to_maddr(shm->pages[n]);
@@ -1010,12 +1073,34 @@ static int share_shm(struct ffa_shm_mem *shm)
             continue;
         }
 
-        frag_len += sizeof(*addr_range);
-        addr_range++;
+        if ( frag_len == max_frag_len )
+        {
+            if ( first )
+            {
+                ret = ffa_mem_share(tot_len, frag_len, 0, 0, &shm->handle);
+                first = false;
+            }
+            else
+            {
+                ret = ffa_mem_frag_tx(shm->handle, frag_len, shm->sender_id);
+            }
+            if ( ret <= 0 )
+                return ret;
+            frag_len = sizeof(*addr_range);
+            addr_range = buf;
+        }
+        else
+        {
+            frag_len += sizeof(*addr_range);
+            addr_range++;
+        }
         init_range(addr_range, pa);
     }
 
-    return ffa_mem_share(tot_len, frag_len, 0, 0, &shm->handle);
+    if ( first )
+        return ffa_mem_share(tot_len, frag_len, 0, 0, &shm->handle);
+    else
+        return ffa_mem_frag_tx(shm->handle, frag_len, shm->sender_id);
 }
 
 static int read_mem_transaction(uint32_t ffa_vers, const void *buf, size_t blen,
@@ -1092,8 +1177,53 @@ static int read_mem_transaction(uint32_t ffa_vers, const void *buf, size_t blen,
     return 0;
 }
 
+static int add_mem_share_frag(struct mem_frag_state *s, unsigned int offs,
+                              unsigned int frag_len)
+{
+    struct domain *d = current->domain;
+    unsigned int o = offs;
+    unsigned int l;
+    int ret;
+
+    if ( frag_len < o )
+        return FFA_RET_INVALID_PARAMETERS;
+
+    /* Fill up the first struct ffa_address_range */
+    l = min_t(unsigned int, frag_len - o, sizeof(s->range) - s->range_offset);
+    memcpy((uint8_t *)&s->range + s->range_offset, s->buf + o, l);
+    s->range_offset += l;
+    o += l;
+    if ( s->range_offset != sizeof(s->range) )
+        goto out;
+    s->range_offset = 0;
+
+    while ( true )
+    {
+        ret = get_shm_pages(d, s->shm, &s->range, 1, s->current_page_idx,
+                            &s->current_page_idx);
+        if ( ret )
+            return ret;
+        if ( s->range_count == 1 )
+            return 0;
+        s->range_count--;
+        if ( frag_len - o < sizeof(s->range) )
+            break;
+        memcpy(&s->range, s->buf + o, sizeof(s->range));
+        o += sizeof(s->range);
+    }
+
+    /* Collect any remaining bytes for the next struct ffa_address_range */
+    s->range_offset = frag_len - o;
+    memcpy(&s->range, s->buf + o, frag_len - o);
+out:
+    s->frag_offset += frag_len;
+
+    return s->frag_offset;
+}
+
 static void handle_mem_share(struct cpu_user_regs *regs)
 {
+    static uint64_t next_handle = FFA_HANDLE_HYP_FLAG;
     uint32_t tot_len = get_user_reg(regs, 1);
     uint32_t frag_len = get_user_reg(regs, 2);
     uint64_t addr = get_user_reg(regs, 3);
@@ -1125,13 +1255,6 @@ static void handle_mem_share(struct cpu_user_regs *regs)
     if ( frag_len > tot_len )
     {
         ret = FFA_RET_INVALID_PARAMETERS;
-        goto out_set_ret;
-    }
-
-    /* We currently only support a single fragment */
-    if ( frag_len != tot_len )
-    {
-        ret = FFA_RET_NOT_SUPPORTED;
         goto out_set_ret;
     }
 
@@ -1195,10 +1318,40 @@ static void handle_mem_share(struct cpu_user_regs *regs)
     if ( !shm )
     {
         ret = FFA_RET_NO_MEMORY;
-        goto out_unlock;
+        goto out;
     }
     shm->sender_id = trans.sender_id;
     shm->ep_id = read_atomic(&mem_access->access_perm.endpoint_id);
+
+    if ( frag_len != tot_len )
+    {
+        struct mem_frag_state *s = xzalloc(struct mem_frag_state);
+
+        if ( !s )
+        {
+            ret = FFA_RET_NO_MEMORY;
+            goto out;
+        }
+        s->shm = shm;
+        s->range_count = range_count;
+        s->buf = ctx->tx;
+        s->buf_size = ffa_page_count * FFA_PAGE_SIZE;
+        ret = add_mem_share_frag(s, sizeof(*region_descr)  + region_offs,
+                                 frag_len);
+        if ( ret <= 0 )
+        {
+            xfree(s);
+            if ( ret < 0 )
+                goto out;
+        }
+        else
+        {
+            shm->handle = next_handle++;
+            uint64_to_regpair(&handle_hi, &handle_lo, shm->handle);
+            list_add_tail(&s->list, &ctx->frag_list);
+        }
+        goto out_unlock;
+    }
 
     /*
      * Check that the Composite memory region descriptor fits.
@@ -1238,7 +1391,75 @@ out_unlock:
     spin_unlock(&ctx->lock);
 
 out_set_ret:
-    if ( ret == 0)
+    if ( ret > 0 )
+            set_regs_frag_rx(regs, handle_lo, handle_hi, ret, trans.sender_id);
+    else if ( ret == 0)
+            set_regs_success(regs, handle_lo, handle_hi);
+    else
+            set_regs_error(regs, ret);
+}
+
+static struct mem_frag_state *find_frag_state(struct ffa_ctx *ctx,
+                                              uint64_t handle)
+{
+    struct mem_frag_state *s;
+
+    list_for_each_entry(s, &ctx->frag_list, list)
+        if ( s->shm->handle == handle )
+            return s;
+
+    return NULL;
+}
+
+static void handle_mem_frag_tx(struct cpu_user_regs *regs)
+{
+    struct domain *d = current->domain;
+    struct ffa_ctx *ctx = d->arch.tee;
+    uint32_t frag_len = get_user_reg(regs, 3);
+    uint32_t handle_lo = get_user_reg(regs, 1);
+    uint32_t handle_hi = get_user_reg(regs, 2);
+    uint64_t handle = regpair_to_uint64(handle_hi, handle_lo);
+    struct mem_frag_state *s;
+    uint16_t sender_id = 0;
+    int ret;
+
+    spin_lock(&ctx->lock);
+    s = find_frag_state(ctx, handle);
+    if ( !s )
+    {
+        ret = FFA_RET_INVALID_PARAMETERS;
+        goto out;
+    }
+    sender_id = s->shm->sender_id;
+
+    if ( frag_len > s->buf_size )
+    {
+        ret = FFA_RET_INVALID_PARAMETERS;
+        goto out;
+    }
+
+    ret = add_mem_share_frag(s, 0, frag_len);
+    if ( ret == 0 )
+    {
+        /* Note that share_shm() uses our tx buffer */
+        spin_lock(&ffa_tx_buffer_lock);
+        ret = share_shm(s->shm);
+        spin_unlock(&ffa_tx_buffer_lock);
+        if ( ret == 0 )
+            list_add_tail(&s->shm->list, &ctx->shm_list);
+        else
+            free_ffa_shm_mem(ctx, s->shm);
+    }
+    else if ( ret < 0 )
+        free_ffa_shm_mem(ctx, s->shm);
+    list_del(&s->list);
+    xfree(s);
+out:
+    spin_unlock(&ctx->lock);
+
+    if ( ret > 0 )
+            set_regs_frag_rx(regs, handle_lo, handle_hi, ret, sender_id);
+    else if ( ret == 0)
             set_regs_success(regs, handle_lo, handle_hi);
     else
             set_regs_error(regs, ret);
@@ -1357,6 +1578,9 @@ static bool ffa_handle_call(struct cpu_user_regs *regs)
         else
             set_regs_success(regs, 0, 0);
         return true;
+    case FFA_MEM_FRAG_TX:
+        handle_mem_frag_tx(regs);
+        return true;
 
     default:
         gprintk(XENLOG_ERR, "ffa: unhandled fid 0x%x\n", fid);
@@ -1396,6 +1620,7 @@ static int ffa_domain_init(struct domain *d)
         }
     }
 
+    INIT_LIST_HEAD(&ctx->frag_list);
     INIT_LIST_HEAD(&ctx->shm_list);
 
     d->arch.tee = ctx;
@@ -1560,6 +1785,7 @@ static bool ffa_probe(void)
 #endif
          !check_mandatory_feature(FFA_RXTX_UNMAP) ||
          !check_mandatory_feature(FFA_MEM_SHARE_32) ||
+         !check_mandatory_feature(FFA_MEM_FRAG_TX) ||
          !check_mandatory_feature(FFA_MEM_RECLAIM) ||
          !check_mandatory_feature(FFA_MSG_SEND_DIRECT_REQ_32) )
         return false;
