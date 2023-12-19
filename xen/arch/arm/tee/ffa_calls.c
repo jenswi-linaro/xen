@@ -285,6 +285,57 @@ out:
                  resp.a7 & mask);
 }
 
+static void handle_features(struct cpu_user_regs *regs)
+{
+    const struct arm_smccc_1_2_regs arg = {
+        .a0 = FFA_FEATURES,
+        .a1 = get_user_reg(regs, 1),
+        .a2 = get_user_reg(regs, 2),
+        .a3 = get_user_reg(regs, 3),
+        .a4 = get_user_reg(regs, 4),
+        .a5 = get_user_reg(regs, 5),
+        .a6 = get_user_reg(regs, 6),
+        .a7 = get_user_reg(regs, 7),
+    };
+    struct arm_smccc_1_2_regs resp;
+
+    if ( arg.a2 || arg.a3 || arg.a4 || arg.a5 || arg.a6 || arg.a7 )
+    {
+            ffa_set_regs_error(regs, FFA_RET_NOT_SUPPORTED);
+            return;
+    }
+
+    switch ( arg.a1 )
+    {
+    case FFA_ERROR:
+    case FFA_VERSION:
+    case FFA_SUCCESS_32:
+    case FFA_SUCCESS_64:
+    case FFA_FEATURES:
+    case FFA_ID_GET:
+    case FFA_RX_RELEASE:
+    case FFA_MEM_SHARE_64:
+    case FFA_MEM_SHARE_32:
+        ffa_set_regs_success(regs, 0, 0);
+        break;
+    /* Function and feature IDs that we need to forward to the SPMC */
+    case FFA_RXTX_MAP_64:
+    case FFA_RXTX_MAP_32:
+    case FFA_RXTX_UNMAP:
+    case FFA_MEM_RECLAIM:
+    case FFA_PARTITION_INFO_GET:
+    case FFA_MSG_SEND_DIRECT_REQ_32:
+    case FFA_MSG_SEND_DIRECT_REQ_64:
+        arm_smccc_1_2_smc(&arg, &resp);
+        ffa_set_regs(regs, resp.a0, resp.a1, resp.a2, resp.a3, resp.a4,
+                     resp.a5, resp.a6, resp.a7);
+        break;
+    default:
+        ffa_set_regs_error(regs, FFA_RET_NOT_SUPPORTED);
+        break;
+    }
+}
+
 bool ffa_handle_call(struct cpu_user_regs *regs)
 {
     uint32_t fid = get_user_reg(regs, 0);
@@ -304,6 +355,9 @@ bool ffa_handle_call(struct cpu_user_regs *regs)
         return true;
     case FFA_ID_GET:
         ffa_set_regs_success(regs, ffa_get_vm_id(d), 0);
+        return true;
+    case FFA_FEATURES:
+        handle_features(regs);
         return true;
     case FFA_RXTX_MAP_32:
     case FFA_RXTX_MAP_64:
