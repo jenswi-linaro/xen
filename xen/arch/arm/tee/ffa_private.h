@@ -296,12 +296,20 @@ extern void *ffa_tx;
 extern spinlock_t ffa_rx_buffer_lock;
 extern spinlock_t ffa_tx_buffer_lock;
 
+bool ffa_handle_call(struct cpu_user_regs *regs);
 void ffa_handle_mem_share(struct cpu_user_regs *regs);
 int ffa_handle_mem_reclaim(uint64_t handle, uint32_t flags);
 void ffa_reclaim_shms(struct domain *d);
 int32_t ffa_simple_call(uint32_t fid, register_t a1, register_t a2,
                         register_t a3, register_t a4);
 uint16_t ffa_get_vm_id(const struct domain *d);
+int32_t ffa_rx_release(void);
+int32_t ffa_partition_info_get(uint32_t w1, uint32_t w2, uint32_t w3,
+                               uint32_t w4, uint32_t w5,
+                               uint32_t *count, uint32_t *fpi_size);
+
+void ffa_ctx_rxtx_unmap(struct ffa_ctx *ctx);
+
 
 void ffa_set_regs(struct cpu_user_regs *regs, register_t v0, register_t v1,
                   register_t v2, register_t v3, register_t v4, register_t v5,
