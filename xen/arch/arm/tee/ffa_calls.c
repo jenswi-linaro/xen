@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * Copyright (C) 2023  Linaro Limited
+ * Copyright (C) 2024  Linaro Limited
  */
 
 #include <xen/const.h>
@@ -287,6 +287,8 @@ out:
 
 static void handle_features(struct cpu_user_regs *regs)
 {
+    struct domain *d = current->domain;
+    struct ffa_ctx *ctx = d->arch.tee;
     const struct arm_smccc_1_2_regs arg = {
         .a0 = FFA_FEATURES,
         .a1 = get_user_reg(regs, 1),
@@ -318,6 +320,24 @@ static void handle_features(struct cpu_user_regs *regs)
     case FFA_MEM_SHARE_32:
         ffa_set_regs_success(regs, 0, 0);
         break;
+    case FFA_FEATURE_NOTIF_PEND_INTR:
+        if ( ctx->notif )
+            ffa_set_regs_success(regs, ctx->notif->intid, 0);
+        else
+            ffa_set_regs_error(regs, FFA_RET_NOT_SUPPORTED);
+        break;
+    case FFA_NOTIFICATION_BIND:
+    case FFA_NOTIFICATION_UNBIND:
+    case FFA_NOTIFICATION_GET:
+    case FFA_NOTIFICATION_SET:
+    case FFA_NOTIFICATION_INFO_GET_32:
+    case FFA_NOTIFICATION_INFO_GET_64:
+        if ( ctx->notif )
+            ffa_set_regs_success(regs, 0, 0);
+        else
+            ffa_set_regs_error(regs, FFA_RET_NOT_SUPPORTED);
+        break;
+
     /* Function and feature IDs that we need to forward to the SPMC */
     case FFA_RXTX_MAP_64:
     case FFA_RXTX_MAP_32:
@@ -409,6 +429,22 @@ bool ffa_handle_call(struct cpu_user_regs *regs)
             ffa_set_regs_error(regs, e);
         else
             ffa_set_regs_success(regs, 0, 0);
+        return true;
+    case FFA_NOTIFICATION_BIND:
+        ffa_handle_notification_bind(regs);
+        return true;
+    case FFA_NOTIFICATION_UNBIND:
+        ffa_handle_notification_unbind(regs);
+        return true;
+    case FFA_NOTIFICATION_INFO_GET_32:
+    case FFA_NOTIFICATION_INFO_GET_64:
+        ffa_handle_notification_info_get(regs);
+        return true;
+    case FFA_NOTIFICATION_GET:
+        ffa_handle_notification_get(regs);
+        return true;
+    case FFA_NOTIFICATION_SET:
+        ffa_handle_notification_set(regs);
         return true;
 
     default:

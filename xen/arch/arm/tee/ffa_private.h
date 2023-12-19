@@ -25,6 +25,7 @@
 #define FFA_RET_DENIED                  -6
 #define FFA_RET_RETRY                   -7
 #define FFA_RET_ABORTED                 -8
+#define FFA_RET_NO_DATA                 -9
 
 /* FFA_VERSION helpers */
 #define FFA_VERSION_MAJOR_SHIFT         16U
@@ -59,6 +60,8 @@
  * specification.
  */
 #define FFA_PAGE_SIZE                   SZ_4K
+
+#define FFA_NOTIF_BITMAP_SIZE           64
 
 /*
  * The number of pages used for each of the RX and TX buffers shared with
@@ -176,10 +179,15 @@
 #define FFA_PARTITION_INFO_GET_COUNT_FLAG BIT(0, U)
 
 /* Flags used in calls to FFA_NOTIFICATION_GET interface  */
-#define FFA_NOTIF_FLAG_BITMAP_SP        BIT(0, U);
-#define FFA_NOTIF_FLAG_BITMAP_VM        BIT(1, U);
-#define FFA_NOTIF_FLAG_BITMAP_SPM       BIT(2, U);
-#define FFA_NOTIF_FLAG_BITMAP_HYP       BIT(3, U);
+#define FFA_NOTIF_FLAG_BITMAP_SP        BIT(0, U)
+#define FFA_NOTIF_FLAG_BITMAP_VM        BIT(1, U)
+#define FFA_NOTIF_FLAG_BITMAP_SPM       BIT(2, U)
+#define FFA_NOTIF_FLAG_BITMAP_HYP       BIT(3, U)
+
+#define FFA_NOTIF_INFO_GET_MORE_FLAG        BIT(0, U)
+#define FFA_NOTIF_INFO_GET_ID_LIST_SHIFT    12
+#define FFA_NOTIF_INFO_GET_ID_COUNT_SHIFT   7
+#define FFA_NOTIF_INFO_GET_ID_COUNT_MASK    0x1F
 
 /* Feature IDs used with FFA_FEATURES */
 #define FFA_FEATURE_NOTIF_PEND_INTR     0x1U
@@ -267,6 +275,25 @@ struct ffa_endpoint_rxtx_descriptor_1_1 {
     uint32_t tx_region_offs;
 };
 
+struct ffa_ctx_notif {
+    unsigned int intid;
+    bool bitmap_created;
+
+    /* Used to serialize access to the rest of this struct */
+    spinlock_t lock;
+
+    /*
+     * True if domain is reported by FFA_NOTIFICATION_INFO_GET to have
+     * pending global notifications.
+     */
+    bool spm_pending_global;
+    /*
+     * A bitmap of vCPUS reported by FFA_NOTIFICATION_INFO_GET with pending
+     * notifications.
+     */
+    unsigned long spm_pending_vcpus[];
+};
+
 struct ffa_ctx {
     void *rx;
     const void *tx;
@@ -281,6 +308,7 @@ struct ffa_ctx {
     struct list_head shm_list;
     /* Number of allocated shared memory object */
     unsigned int shm_count;
+    struct ffa_ctx_notif *notif;
     /*
      * tx_lock is used to serialize access to tx
      * rx_lock is used to serialize access to rx
@@ -314,6 +342,7 @@ extern void *ffa_rx;
 extern void *ffa_tx;
 extern spinlock_t ffa_rx_buffer_lock;
 extern spinlock_t ffa_tx_buffer_lock;
+extern bool notif_enabled;
 
 bool ffa_handle_call(struct cpu_user_regs *regs);
 void ffa_handle_mem_share(struct cpu_user_regs *regs);
@@ -322,6 +351,7 @@ void ffa_reclaim_shms(struct domain *d);
 int32_t ffa_simple_call(uint32_t fid, register_t a1, register_t a2,
                         register_t a3, register_t a4);
 uint16_t ffa_get_vm_id(const struct domain *d);
+struct domain *ffa_get_domain_by_vm_id(uint16_t vm_id);
 int32_t ffa_rx_release(void);
 int32_t ffa_partition_info_get(uint32_t w1, uint32_t w2, uint32_t w3,
                                uint32_t w4, uint32_t w5,
@@ -329,7 +359,14 @@ int32_t ffa_partition_info_get(uint32_t w1, uint32_t w2, uint32_t w3,
 
 void ffa_ctx_rxtx_unmap(struct ffa_ctx *ctx);
 
+void ffa_handle_notification_bind(struct cpu_user_regs *regs);
+void ffa_handle_notification_unbind(struct cpu_user_regs *regs);
+void ffa_handle_notification_info_get(struct cpu_user_regs *regs);
+void ffa_handle_notification_get(struct cpu_user_regs *regs);
+void ffa_handle_notification_set(struct cpu_user_regs *regs);
+void ffa_notif_irq_handler(int irq, void *data, struct cpu_user_regs *regs);
 
+int32_t ffa_get_ret_code(const struct arm_smccc_1_2_regs *resp);
 void ffa_set_regs(struct cpu_user_regs *regs, register_t v0, register_t v1,
                   register_t v2, register_t v3, register_t v4, register_t v5,
                   register_t v6, register_t v7);
