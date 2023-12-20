@@ -69,6 +69,7 @@
 static uint32_t __ro_after_init ffa_version;
 
 
+
 /*
  * Our rx/tx buffers shared with the SPMC. FFA_RXTX_PAGE_COUNT is the
  * number of pages used in each of these buffers.
@@ -194,6 +195,8 @@ out:
 
 static void handle_features(struct cpu_user_regs *regs)
 {
+    struct domain *d = current->domain;
+    struct ffa_ctx *ctx = d->arch.tee;
     uint32_t a1 = get_user_reg(regs, 1);
     unsigned int n;
 
@@ -227,6 +230,23 @@ static void handle_features(struct cpu_user_regs *regs)
     case FFA_RXTX_MAP_64:
     case FFA_RXTX_MAP_32:
         ffa_set_regs_success(regs, FFA_MAX_RXTX_PAGE_COUNT << 16, 0);
+        break;
+    case FFA_FEATURE_NOTIF_PEND_INTR:
+        if ( ctx->notif )
+            ffa_set_regs_success(regs, ctx->notif->intid, 0);
+        else
+            ffa_set_regs_error(regs, FFA_RET_NOT_SUPPORTED);
+        break;
+    case FFA_NOTIFICATION_BIND:
+    case FFA_NOTIFICATION_UNBIND:
+    case FFA_NOTIFICATION_GET:
+    case FFA_NOTIFICATION_SET:
+    case FFA_NOTIFICATION_INFO_GET_32:
+    case FFA_NOTIFICATION_INFO_GET_64:
+        if ( ctx->notif )
+            ffa_set_regs_success(regs, 0, 0);
+        else
+            ffa_set_regs_error(regs, FFA_RET_NOT_SUPPORTED);
         break;
     default:
         ffa_set_regs_error(regs, FFA_RET_NOT_SUPPORTED);
@@ -309,6 +329,22 @@ static bool ffa_handle_call(struct cpu_user_regs *regs)
         else
             ffa_set_regs_success(regs, 0, 0);
         return true;
+    case FFA_NOTIFICATION_BIND:
+        ffa_handle_notification_bind(regs);
+        return true;
+    case FFA_NOTIFICATION_UNBIND:
+        ffa_handle_notification_unbind(regs);
+        return true;
+    case FFA_NOTIFICATION_INFO_GET_32:
+    case FFA_NOTIFICATION_INFO_GET_64:
+        ffa_handle_notification_info_get(regs);
+        return true;
+    case FFA_NOTIFICATION_GET:
+        ffa_handle_notification_get(regs);
+        return true;
+    case FFA_NOTIFICATION_SET:
+        ffa_handle_notification_set(regs);
+        return true;
 
     default:
         gprintk(XENLOG_ERR, "ffa: unhandled fid 0x%x\n", fid);
@@ -340,6 +376,9 @@ static int ffa_domain_init(struct domain *d)
 
     if ( !ffa_partinfo_domain_init(d) )
         return -EIO;
+
+    if ( !ffa_notif_domain_init(d) )
+        return -ENOMEM;
 
     return 0;
 }
@@ -416,6 +455,7 @@ static int ffa_domain_teardown(struct domain *d)
         return 0;
 
     ffa_rxtx_domain_destroy(d);
+    ffa_notif_domain_destroy(d);
 
     ffa_domain_teardown_continue(ctx, true /* first_time */);
 
@@ -495,6 +535,7 @@ static bool ffa_probe(void)
     if ( !ffa_partinfo_init() )
         goto err_rxtx_uninit;
 
+    ffa_notif_init();
     INIT_LIST_HEAD(&ffa_teardown_head);
     init_timer(&ffa_teardown_timer, ffa_teardown_timer_callback, NULL, 0);
 
