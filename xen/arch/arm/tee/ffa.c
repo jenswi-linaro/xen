@@ -74,6 +74,8 @@ static uint16_t subscr_vm_created_count __read_mostly;
 static uint16_t *subscr_vm_destroyed __read_mostly;
 static uint16_t subscr_vm_destroyed_count __read_mostly;
 
+bool __ro_after_init notif_enabled;
+
 /*
  * Our rx/tx buffers shared with the SPMC. FFA_RXTX_PAGE_COUNT is the
  * number of pages used in each of these buffers.
@@ -134,6 +136,18 @@ static int32_t ffa_rxtx_map(paddr_t tx_addr, paddr_t rx_addr,
                             uint32_t page_count)
 {
     return ffa_simple_call(FFA_RXTX_MAP_64, tx_addr, rx_addr, page_count, 0);
+}
+
+static int32_t ffa_notification_bitmap_create(uint16_t vm_id,
+                                              uint32_t vcpu_count)
+{
+    return ffa_simple_call(FFA_NOTIFICATION_BITMAP_CREATE, vm_id, vcpu_count,
+                           0, 0);
+}
+
+static int32_t ffa_notification_bitmap_destroy(uint16_t vm_id)
+{
+    return ffa_simple_call(FFA_NOTIFICATION_BITMAP_DESTROY, vm_id, 0, 0, 0);
 }
 
 static int32_t ffa_direct_req_send_vm(uint16_t sp_id, uint16_t vm_id,
@@ -257,6 +271,8 @@ out:
 
 static void handle_features(struct cpu_user_regs *regs)
 {
+    struct domain *d = current->domain;
+    struct ffa_ctx *ctx = d->arch.tee;
     uint32_t a1 = get_user_reg(regs, 1);
     unsigned int n;
 
@@ -290,6 +306,23 @@ static void handle_features(struct cpu_user_regs *regs)
     case FFA_RXTX_MAP_64:
     case FFA_RXTX_MAP_32:
         ffa_set_regs_success(regs, FFA_MAX_RXTX_PAGE_COUNT << 16, 0);
+        break;
+    case FFA_FEATURE_NOTIF_PEND_INTR:
+        if ( ctx->notif )
+            ffa_set_regs_success(regs, ctx->notif->intid, 0);
+        else
+            ffa_set_regs_error(regs, FFA_RET_NOT_SUPPORTED);
+        break;
+    case FFA_NOTIFICATION_BIND:
+    case FFA_NOTIFICATION_UNBIND:
+    case FFA_NOTIFICATION_GET:
+    case FFA_NOTIFICATION_SET:
+    case FFA_NOTIFICATION_INFO_GET_32:
+    case FFA_NOTIFICATION_INFO_GET_64:
+        if ( ctx->notif )
+            ffa_set_regs_success(regs, 0, 0);
+        else
+            ffa_set_regs_error(regs, FFA_RET_NOT_SUPPORTED);
         break;
     default:
         ffa_set_regs_error(regs, FFA_RET_NOT_SUPPORTED);
@@ -372,6 +405,22 @@ static bool ffa_handle_call(struct cpu_user_regs *regs)
         else
             ffa_set_regs_success(regs, 0, 0);
         return true;
+    case FFA_NOTIFICATION_BIND:
+        ffa_handle_notification_bind(regs);
+        return true;
+    case FFA_NOTIFICATION_UNBIND:
+        ffa_handle_notification_unbind(regs);
+        return true;
+    case FFA_NOTIFICATION_INFO_GET_32:
+    case FFA_NOTIFICATION_INFO_GET_64:
+        ffa_handle_notification_info_get(regs);
+        return true;
+    case FFA_NOTIFICATION_GET:
+        ffa_handle_notification_get(regs);
+        return true;
+    case FFA_NOTIFICATION_SET:
+        ffa_handle_notification_set(regs);
+        return true;
 
     default:
         gprintk(XENLOG_ERR, "ffa: unhandled fid 0x%x\n", fid);
@@ -434,10 +483,14 @@ static int ffa_domain_init(struct domain *d)
                               BITS_TO_LONGS(subscr_vm_destroyed_count));
     if ( !ctx )
         return -ENOMEM;
+    ctx->notif = xzalloc(struct ffa_ctx_notif);
 
     d->arch.tee = ctx;
     ctx->teardown_d = d;
     INIT_LIST_HEAD(&ctx->shm_list);
+
+    if ( !ctx->notif )
+        return -ENOMEM;
 
     for ( n = 0; n < subscr_vm_created_count; n++ )
     {
@@ -453,6 +506,31 @@ static int ffa_domain_init(struct domain *d)
     vm_destroy_bitmap_init(ctx, n);
     if ( n != subscr_vm_created_count )
         return -EIO;
+
+    if ( notif_enabled )
+    {
+        res = ffa_notification_bitmap_create(ffa_get_vm_id(d), d->max_vcpus);
+        if ( res )
+            return res;
+        ctx->notif->bitmap_created = true;
+        /*
+         * TODO How to manage the available SGIs? SGI 8-15 seem to be
+         * entirely unused, but that may change.
+         *
+         * Compare with how a PPI would have been handled:
+         *  res = vgic_allocate_ppi(d);
+         *  if ( res <= 0 )
+         *      return res;
+         *
+         * SGI is the preferred delivery mechanism. SGIs 8-15 are normally
+         * not used by a guest as they in a non-virtualized system
+         * typically are assigned to the secure world. Here we're free to
+         * use SGI 8-15 since they are virtual and have nothing to do with
+         * the secure world.
+         */
+        ctx->notif->intid = 8;
+        printk(XENLOG_ERR "ffa: allocated intid %d\n", res);
+    }
 
     return 0;
 }
@@ -560,6 +638,16 @@ static int ffa_domain_teardown(struct domain *d)
     if ( ctx->rx )
         ffa_rxtx_unmap(ctx);
 
+    if ( ctx->notif )
+    {
+        if ( ctx->notif->bitmap_created )
+            ffa_notification_bitmap_destroy(ffa_get_vm_id(d));
+        /* SGIs are always reserved */
+        if ( ctx->notif->intid >= NR_GIC_SGI )
+            vgic_free_virq(d, ctx->notif->intid);
+        XFREE(ctx->notif);
+    }
+
     ffa_domain_teardown_continue(ctx, true /* first_time */);
 
     return 0;
@@ -646,6 +734,30 @@ out:
     return ret;
 }
 
+static void init_notif(void)
+{
+    const struct arm_smccc_1_2_regs arg = {
+        .a0 = FFA_FEATURES,
+        .a1 = FFA_FEATURE_SCHEDULE_RECV_INTR,
+    };
+    struct arm_smccc_1_2_regs resp;
+    unsigned int irq;
+    int ret;
+
+    arm_smccc_1_2_smc(&arg, &resp);
+    if ( resp.a0 != FFA_SUCCESS_32 )
+        return;
+
+    irq = resp.a2;
+    if ( irq >= NR_GIC_SGI )
+        irq_set_type(irq, IRQ_TYPE_EDGE_RISING);
+    ret = request_irq(irq, 0, ffa_notif_irq_handler, "FF-A notif", NULL);
+    if ( ret )
+        printk(XENLOG_ERR "ffa: request_irq irq %u failed: error %d\n",
+               irq, ret);
+    notif_enabled = !ret;
+}
+
 static bool ffa_probe(void)
 {
     uint32_t vers;
@@ -726,6 +838,7 @@ static bool ffa_probe(void)
     if ( !init_sps() )
         goto err_free_ffa_tx;
 
+    init_notif();
     INIT_LIST_HEAD(&ffa_teardown_head);
     init_timer(&ffa_teardown_timer, ffa_teardown_timer_callback, NULL, 0);
 
