@@ -225,9 +225,12 @@ void do_IRQ(struct cpu_user_regs *regs, unsigned int irq, int is_fiq)
 
     perfc_incr(irqs);
 
-    ASSERT(irq >= 16); /* SGIs do not come down this path */
+    /* Statically assigned SGIs do not come down this path */
+    ASSERT(irq >= GIC_SGI_MAX);
 
-    if ( irq < 32 )
+    if ( irq < 16 )
+        perfc_incr(ipis);
+    else if ( irq < 32 )
         perfc_incr(ppis);
     else
         perfc_incr(spis);
