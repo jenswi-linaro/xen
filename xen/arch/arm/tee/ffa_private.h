@@ -240,6 +240,36 @@
 #define FFA_NOTIFICATION_INFO_GET_32    0x84000083U
 #define FFA_NOTIFICATION_INFO_GET_64    0xC4000083U
 
+/**
+ * Encoding of features supported or not by the fw in a 64bit value:
+ * - Function IDs are going from 0x60 to 0x86 so we have a maximum of 38 so
+ *   forsee for up to 63
+ * - We have one set of definitions and variable for 32bit and one for 64bit
+ * We use a 64bit value to encode one bit for each function.
+ * This allows us to have a 64bit value used to encode functions supported
+ * or not which makes it easier to test if a call can be forwarded to the
+ * firmware or not.
+ */
+#define FEAT_FUNC_TO_NUM(id)    (((id) - FFA_ERROR) & 0x3FU)
+#define FEAT_FUNC_TO_BIT(id)    (1ULL<<FEAT_FUNC_TO_NUM(id))
+#define FEAT32_TO_FID(f)        (FFA_ERROR + (f))
+#define FEAT64_TO_FID(f)        (FEAT32_TO_FID(f) | \
+                                 (ARM_SMCCC_CONV_64 << ARM_SMCCC_CONV_SHIFT))
+
+/* List of functions we need from firmware */
+#define FEAT32_FW_NEEDED     (FEAT_FUNC_TO_BIT(FFA_VERSION) \
+                              | FEAT_FUNC_TO_BIT(FFA_FEATURES) \
+                              | FEAT_FUNC_TO_BIT(FFA_PARTITION_INFO_GET) \
+                              | FEAT_FUNC_TO_BIT(FFA_RX_RELEASE) \
+                              | FEAT_FUNC_TO_BIT(FFA_RXTX_UNMAP) \
+                              | FEAT_FUNC_TO_BIT(FFA_MEM_SHARE_32) \
+                              | FEAT_FUNC_TO_BIT(FFA_MEM_RECLAIM) \
+                              | FEAT_FUNC_TO_BIT(FFA_MSG_SEND_DIRECT_REQ_32))
+
+#define FEAT64_FW_NEEDED     (FEAT_FUNC_TO_BIT(FFA_RXTX_MAP_64) \
+                              | FEAT_FUNC_TO_BIT(FFA_MEM_SHARE_64) \
+                              | FEAT_FUNC_TO_BIT(FFA_MSG_SEND_DIRECT_REQ_64))
+
 struct ffa_ctx_notif {
     unsigned int intid;
 
