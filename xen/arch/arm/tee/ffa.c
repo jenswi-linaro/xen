@@ -65,8 +65,8 @@
 
 #include "ffa_private.h"
 
-/* Negotiated FF-A version to use with the SPMC */
-static uint32_t __ro_after_init ffa_version;
+/* Negotiated FF-A version to use with the SPMC, 0 if not there or supported */
+static uint32_t __ro_after_init ffa_fw_version;
 
 
 
@@ -100,10 +100,7 @@ static bool ffa_get_version(uint32_t *vers)
 
     arm_smccc_1_2_smc(&arg, &resp);
     if ( resp.a0 == FFA_RET_NOT_SUPPORTED )
-    {
-        gprintk(XENLOG_ERR, "ffa: FFA_VERSION returned not supported\n");
         return false;
-    }
 
     *vers = resp.a0;
 
@@ -357,7 +354,7 @@ static int ffa_domain_init(struct domain *d)
 {
     struct ffa_ctx *ctx;
 
-    if ( !ffa_version )
+    if ( !ffa_fw_version )
         return -ENODEV;
      /*
       * We can't use that last possible domain ID or ffa_get_vm_id() would
@@ -484,6 +481,9 @@ static bool ffa_probe(void)
      */
     BUILD_BUG_ON(PAGE_SIZE != FFA_PAGE_SIZE);
 
+    printk(XENLOG_INFO "ARM FF-A Mediator version %u.%u\n",
+           FFA_MY_VERSION_MAJOR, FFA_MY_VERSION_MINOR);
+
     /*
      * psci_init_smccc() updates this value with what's reported by EL-3
      * or secure world.
@@ -493,31 +493,21 @@ static bool ffa_probe(void)
         printk(XENLOG_ERR
                "ffa: unsupported SMCCC version %#x (need at least %#x)\n",
                smccc_ver, ARM_SMCCC_VERSION_1_2);
-        return false;
     }
-
-    if ( !ffa_get_version(&vers) )
-        return false;
-
-    if ( vers < FFA_MIN_SPMC_VERSION || vers > FFA_MY_VERSION )
+    else if ( !ffa_get_version(&vers) )
+    {
+        gprintk(XENLOG_ERR, "ffa: FFA_VERSION returned not supported\n");
+    }
+    else if ( vers < FFA_MIN_SPMC_VERSION || vers > FFA_MY_VERSION )
     {
         printk(XENLOG_ERR "ffa: Incompatible version %#x found\n", vers);
-        return false;
     }
-
-    major_vers = (vers >> FFA_VERSION_MAJOR_SHIFT) & FFA_VERSION_MAJOR_MASK;
-    minor_vers = vers & FFA_VERSION_MINOR_MASK;
-    printk(XENLOG_INFO "ARM FF-A Mediator version %u.%u\n",
-           FFA_MY_VERSION_MAJOR, FFA_MY_VERSION_MINOR);
-    printk(XENLOG_INFO "ARM FF-A Firmware version %u.%u\n",
-           major_vers, minor_vers);
-
     /*
      * At the moment domains must support the same features used by Xen.
      * TODO: Rework the code to allow domain to use a subset of the
      * features supported.
      */
-    if ( !check_mandatory_feature(FFA_PARTITION_INFO_GET) ||
+    else if ( !check_mandatory_feature(FFA_PARTITION_INFO_GET) ||
          !check_mandatory_feature(FFA_RX_RELEASE) ||
          !check_mandatory_feature(FFA_RXTX_MAP_64) ||
          !check_mandatory_feature(FFA_MEM_SHARE_64) ||
@@ -525,12 +515,28 @@ static bool ffa_probe(void)
          !check_mandatory_feature(FFA_MEM_SHARE_32) ||
          !check_mandatory_feature(FFA_MEM_RECLAIM) ||
          !check_mandatory_feature(FFA_MSG_SEND_DIRECT_REQ_32) )
+    {
+        printk(XENLOG_ERR "ffa: Mandatory feature not supported by fw\n");
+    }
+    else
+    {
+        major_vers = (vers >> FFA_VERSION_MAJOR_SHIFT)
+                     & FFA_VERSION_MAJOR_MASK;
+        minor_vers = vers & FFA_VERSION_MINOR_MASK;
+        printk(XENLOG_INFO "ARM FF-A Firmware version %u.%u\n",
+               major_vers, minor_vers);
+
+        ffa_fw_version = vers;
+    }
+
+    if ( !ffa_fw_version )
+    {
+        printk(XENLOG_INFO "ARM FF-A No firmware support\n");
         return false;
+    }
 
     if ( !ffa_rxtx_init() )
         return false;
-
-    ffa_version = vers;
 
     if ( !ffa_partinfo_init() )
         goto err_rxtx_uninit;
@@ -543,7 +549,7 @@ static bool ffa_probe(void)
 
 err_rxtx_uninit:
     ffa_rxtx_uninit();
-    ffa_version = 0;
+    ffa_fw_version = 0;
 
     return false;
 }
