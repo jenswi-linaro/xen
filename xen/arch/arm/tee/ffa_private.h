@@ -233,6 +233,7 @@ struct ffa_partition_info_1_1 {
     uint8_t uuid[16];
 };
 
+
 /* Endpoint RX/TX descriptor */
 struct ffa_endpoint_rxtx_descriptor_1_0 {
     uint16_t sender_id;
@@ -290,6 +291,13 @@ extern spinlock_t ffa_tx_buffer_lock;
 void ffa_handle_mem_share(struct cpu_user_regs *regs);
 int ffa_handle_mem_reclaim(uint64_t handle, uint32_t flags);
 void ffa_reclaim_shms(struct domain *d);
+int32_t ffa_handle_partition_info_get(uint32_t w1, uint32_t w2, uint32_t w3,
+                                      uint32_t w4, uint32_t w5, uint32_t *count,
+                                      uint32_t *fpi_size);
+
+int32_t ffa_partition_info_get(uint32_t w1, uint32_t w2, uint32_t w3,
+                               uint32_t w4, uint32_t w5, uint32_t *count,
+                               uint32_t *fpi_size);
 
 static inline uint16_t ffa_get_vm_id(const struct domain *d)
 {
@@ -357,6 +365,11 @@ static inline int32_t ffa_simple_call(uint32_t fid, register_t a1,
     arm_smccc_1_2_smc(&arg, &resp);
 
     return ffa_get_ret_code(&resp);
+}
+
+static inline int32_t ffa_rx_release(void)
+{
+    return ffa_simple_call(FFA_RX_RELEASE, 0, 0, 0, 0);
 }
 
 #endif /*__FFA_PRIVATE_H__*/
