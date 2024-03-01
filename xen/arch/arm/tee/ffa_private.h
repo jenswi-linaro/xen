@@ -214,6 +214,13 @@
 #define FFA_MSG_SEND                    0x8400006EU
 #define FFA_MSG_POLL                    0x8400006AU
 
+struct ffa_partition_info_1_1 {
+    uint16_t id;
+    uint16_t execution_context;
+    uint32_t partition_properties;
+    uint8_t uuid[16];
+};
+
 struct ffa_ctx {
     void *rx;
     const void *tx;
@@ -255,6 +262,13 @@ extern spinlock_t ffa_tx_buffer_lock;
 void ffa_handle_mem_share(struct cpu_user_regs *regs);
 int ffa_handle_mem_reclaim(uint64_t handle, uint32_t flags);
 void ffa_reclaim_shms(struct domain *d);
+int32_t ffa_handle_partition_info_get(uint32_t w1, uint32_t w2, uint32_t w3,
+                                      uint32_t w4, uint32_t w5, uint32_t *count,
+                                      uint32_t *fpi_size);
+
+int32_t ffa_partition_info_get(uint32_t w1, uint32_t w2, uint32_t w3,
+                               uint32_t w4, uint32_t w5, uint32_t *count,
+                               uint32_t *fpi_size);
 
 static inline uint16_t ffa_get_vm_id(const struct domain *d)
 {
@@ -322,6 +336,11 @@ static inline int32_t ffa_simple_call(uint32_t fid, register_t a1,
     arm_smccc_1_2_smc(&arg, &resp);
 
     return ffa_get_ret_code(&resp);
+}
+
+static inline int32_t ffa_rx_release(void)
+{
+    return ffa_simple_call(FFA_RX_RELEASE, 0, 0, 0, 0);
 }
 
 #endif /*__FFA_PRIVATE_H__*/
