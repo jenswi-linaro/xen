@@ -294,7 +294,12 @@ void ffa_reclaim_shms(struct domain *d);
 int32_t ffa_handle_partition_info_get(uint32_t w1, uint32_t w2, uint32_t w3,
                                       uint32_t w4, uint32_t w5, uint32_t *count,
                                       uint32_t *fpi_size);
+uint32_t ffa_handle_rxtx_map(uint32_t fid, register_t tx_addr,
+			     register_t rx_addr, uint32_t page_count);
+uint32_t ffa_handle_rxtx_unmap(void);
+int32_t ffa_handle_rx_release(void);
 
+void ffa_rxtx_unmap(struct ffa_ctx *ctx);
 int32_t ffa_partition_info_get(uint32_t w1, uint32_t w2, uint32_t w3,
                                uint32_t w4, uint32_t w5, uint32_t *count,
                                uint32_t *fpi_size);
