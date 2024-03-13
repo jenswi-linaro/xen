@@ -320,6 +320,8 @@ extern void *ffa_rx;
 extern void *ffa_tx;
 extern spinlock_t ffa_rx_buffer_lock;
 extern spinlock_t ffa_tx_buffer_lock;
+extern uint64_t ffa_fw_feat32_supported;
+extern uint64_t ffa_fw_feat64_supported;
 
 bool ffa_shm_domain_destroy(struct domain *d);
 void ffa_handle_mem_share(struct cpu_user_regs *regs);
@@ -428,6 +430,14 @@ static inline int32_t ffa_simple_call(uint32_t fid, register_t a1,
 static inline int32_t ffa_rx_release(void)
 {
     return ffa_simple_call(FFA_RX_RELEASE, 0, 0, 0, 0);
+}
+
+static inline bool ffa_fw_support_fid(uint32_t fid)
+{
+    if ( smccc_is_conv_64(fid) )
+        return ((ffa_fw_feat64_supported & FEAT_FUNC_TO_BIT(fid)) != 0);
+    else
+        return ((ffa_fw_feat32_supported & FEAT_FUNC_TO_BIT(fid)) != 0);
 }
 
 #endif /*__FFA_PRIVATE_H__*/

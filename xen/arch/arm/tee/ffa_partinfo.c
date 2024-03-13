@@ -77,7 +77,15 @@ int32_t ffa_handle_partition_info_get(uint32_t w1, uint32_t w2, uint32_t w3,
      */
     if ( w5 == FFA_PARTITION_INFO_GET_COUNT_FLAG &&
          ctx->guest_vers == FFA_VERSION_1_1 )
-        return ffa_partition_info_get(w1, w2, w3, w4, w5, count, fpi_size);
+    {
+        if ( ffa_fw_support_fid(FFA_PARTITION_INFO_GET) )
+            return ffa_partition_info_get(w1, w2, w3, w4, w5, count, fpi_size);
+        else
+        {
+            *count = 0;
+            return FFA_RET_OK;
+        }
+    }
     if ( w5 )
         return FFA_RET_INVALID_PARAMETERS;
 
@@ -86,6 +94,18 @@ int32_t ffa_handle_partition_info_get(uint32_t w1, uint32_t w2, uint32_t w3,
 
     if ( !spin_trylock(&ctx->rx_lock) )
         return FFA_RET_BUSY;
+
+    if ( !ffa_fw_support_fid(FFA_PARTITION_INFO_GET) )
+    {
+        if ( ctx->guest_vers == FFA_VERSION_1_0 )
+            *fpi_size = sizeof(struct ffa_partition_info_1_0);
+        else
+            *fpi_size = sizeof(struct ffa_partition_info_1_1);
+
+        *count = 0;
+        ret = FFA_RET_OK;
+        goto out;
+    }
 
     if ( !ctx->page_count || !ctx->rx_is_free )
         goto out;
@@ -197,8 +217,10 @@ static void uninit_subscribers(void)
 {
         subscr_vm_created_count = 0;
         subscr_vm_destroyed_count = 0;
-        XFREE(subscr_vm_created);
-        XFREE(subscr_vm_destroyed);
+        if ( subscr_vm_created )
+            XFREE(subscr_vm_created);
+        if ( subscr_vm_destroyed )
+            XFREE(subscr_vm_destroyed);
 }
 
 static bool init_subscribers(struct ffa_partition_info_1_1 *fpi, uint16_t count)
@@ -250,6 +272,11 @@ bool ffa_partinfo_init(void)
     uint32_t count;
     int e;
 
+    if ( !ffa_fw_support_fid(FFA_PARTITION_INFO_GET) ||
+         !ffa_fw_support_fid(FFA_MSG_SEND_DIRECT_REQ_32) ||
+         !ffa_rx || !ffa_tx )
+        return false;
+
     e = ffa_partition_info_get(0, 0, 0, 0, 0, &count, &fpi_size);
     if ( e )
     {
@@ -267,7 +294,6 @@ bool ffa_partinfo_init(void)
 
 out:
     ffa_rx_release();
-
     return ret;
 }
 
@@ -312,6 +338,9 @@ bool ffa_partinfo_domain_init(struct domain *d)
     struct ffa_ctx *ctx = d->arch.tee;
     unsigned int n;
     int32_t res;
+
+    if ( !ffa_fw_support_fid(FFA_MSG_SEND_DIRECT_REQ_32) )
+        return true;
 
     ctx->vm_destroy_bitmap = xzalloc_array(unsigned long, count);
     if ( !ctx->vm_destroy_bitmap )

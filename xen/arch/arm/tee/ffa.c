@@ -68,8 +68,8 @@
 /* Negotiated FF-A version to use with the SPMC, 0 if not there or supported */
 static uint32_t __ro_after_init ffa_fw_version;
 /* Features supported by the SPMC or secure world when present, 0 otherwise */
-static uint64_t ffa_fw_feat32_supported;
-static uint64_t ffa_fw_feat64_supported;
+uint64_t ffa_fw_feat32_supported;
+uint64_t ffa_fw_feat64_supported;
 
 
 
@@ -142,6 +142,13 @@ static void handle_msg_send_direct_req(struct cpu_user_regs *regs, uint32_t fid)
         mask = GENMASK_ULL(63, 0);
     else
         mask = GENMASK_ULL(31, 0);
+
+    if ( !ffa_fw_support_fid(fid) )
+    {
+        resp.a0 = FFA_ERROR;
+        resp.a2 = FFA_RET_NOT_SUPPORTED;
+        goto out;
+    }
 
     src_dst = get_user_reg(regs, 1);
     if ( (src_dst >> 16) != ffa_get_vm_id(d) )
@@ -346,8 +353,6 @@ static int ffa_domain_init(struct domain *d)
 {
     struct ffa_ctx *ctx;
 
-    if ( !ffa_fw_version )
-        return -ENODEV;
      /*
       * We can't use that last possible domain ID or ffa_get_vm_id() would
       * cause an overflow.
@@ -513,49 +518,46 @@ static bool ffa_probe(void)
                 if ( ffa_feature_supported(FEAT32_TO_FID(featnum)) )
                     ffa_fw_feat32_supported |= 1ULL<<featnum;
                 else
-                {
                     printk(XENLOG_INFO "ARM FF-A Firmware does not support 0x%08x\n",
                            FEAT32_TO_FID(featnum));
-                    ffa_fw_version = 0;
-                }
             }
             if ( (FEAT64_FW_NEEDED & (1ULL<<featnum)) )
             {
                 if ( ffa_feature_supported(FEAT64_TO_FID(featnum)) )
                     ffa_fw_feat64_supported |= 1ULL<<featnum;
                 else
-                {
                     printk(XENLOG_INFO "ARM FF-A Firmware does not support 0x%08x\n",
                            FEAT64_TO_FID(featnum));
-                    ffa_fw_version = 0;
-                }
             }
         }
     }
 
-    if ( !ffa_fw_version )
-    {
-        printk(XENLOG_INFO "ARM FF-A No suitable firmware support\n");
-        return false;
-    }
-
-    if ( !ffa_rxtx_init() )
-        return false;
-
-    if ( !ffa_partinfo_init() )
-        goto err_rxtx_uninit;
-
-    ffa_notif_init();
     INIT_LIST_HEAD(&ffa_teardown_head);
     init_timer(&ffa_teardown_timer, ffa_teardown_timer_callback, NULL, 0);
 
+    if ( !ffa_fw_version )
+        printk(XENLOG_INFO "ARM FF-A No suitable firmware support\n");
+    else
+    {
+        if ( !ffa_rxtx_init() )
+            goto err_disable_fw;
+
+        if ( !ffa_partinfo_init() )
+            goto err_disable_fw;
+
+        ffa_notif_init();
+    }
+
     return true;
 
-err_rxtx_uninit:
+err_disable_fw:
+    printk(XENLOG_ERR "ARM FFA: Error during firmware init, disabling firmware\n");
     ffa_rxtx_uninit();
     ffa_fw_version = 0;
+    ffa_fw_feat32_supported = 0;
+    ffa_fw_feat64_supported = 0;
 
-    return false;
+    return true;
 }
 
 static const struct tee_mediator_ops ffa_ops =
