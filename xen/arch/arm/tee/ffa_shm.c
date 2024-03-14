@@ -536,6 +536,13 @@ void ffa_handle_mem_share(struct cpu_user_regs *regs)
         goto out_unlock;
 
     mem_access = ctx->tx + trans.mem_access_offs;
+    if ( !FFA_ID_IS_SECURE(read_atomic(&mem_access->access_perm.endpoint_id)) )
+    {
+        /* we do not support sharing with VMs */
+        ret = FFA_RET_NOT_SUPPORTED;
+        goto out_unlock;
+    }
+
     if ( read_atomic(&mem_access->access_perm.perm) != FFA_MEM_ACC_RW )
     {
         ret = FFA_RET_NOT_SUPPORTED;
