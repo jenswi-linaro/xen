@@ -310,7 +310,7 @@ static bool ffa_handle_call(struct cpu_user_regs *regs)
             ffa_set_regs_success(regs, count, fpi_size);
         return true;
     case FFA_RX_RELEASE:
-        e = ffa_handle_rx_release();
+        e = ffa_rx_release(d);
         if ( e )
             ffa_set_regs_error(regs, e);
         else

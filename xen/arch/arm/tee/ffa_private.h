@@ -277,6 +277,21 @@
                               | FEAT_FUNC_TO_BIT(FFA_MEM_SHARE_64) \
                               | FEAT_FUNC_TO_BIT(FFA_MSG_SEND_DIRECT_REQ_64))
 
+/* Constituent memory region descriptor */
+struct ffa_address_range {
+    uint64_t address;
+    uint32_t page_count;
+    uint32_t reserved;
+};
+
+/* Composite memory region descriptor */
+struct ffa_mem_region {
+    uint32_t total_page_count;
+    uint32_t address_range_count;
+    uint64_t reserved;
+    struct ffa_address_range address_range_array[];
+};
+
 struct ffa_ctx_notif {
     unsigned int intid;
 
@@ -306,7 +321,7 @@ struct ffa_ctx {
     struct ffa_ctx_notif *notif;
     /*
      * tx_lock is used to serialize access to tx
-     * rx_lock is used to serialize access to rx
+     * rx_lock is used to serialize access to rx_is_free
      * lock is used for the rest in this struct
      */
     spinlock_t tx_lock;
@@ -347,7 +362,8 @@ void ffa_rxtx_domain_destroy(struct domain *d);
 uint32_t ffa_handle_rxtx_map(uint32_t fid, register_t tx_addr,
 			     register_t rx_addr, uint32_t page_count);
 uint32_t ffa_handle_rxtx_unmap(void);
-int32_t ffa_handle_rx_release(void);
+int32_t ffa_rx_acquire(struct domain *d);
+int32_t ffa_rx_release(struct domain *d);
 
 void ffa_notif_init(void);
 bool ffa_notif_domain_init(struct domain *d);
@@ -434,7 +450,7 @@ static inline int32_t ffa_simple_call(uint32_t fid, register_t a1,
     return ffa_get_ret_code(&resp);
 }
 
-static inline int32_t ffa_rx_release(void)
+static inline int32_t ffa_hyp_rx_release(void)
 {
     return ffa_simple_call(FFA_RX_RELEASE, 0, 0, 0, 0);
 }

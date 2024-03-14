@@ -92,8 +92,9 @@ int32_t ffa_handle_partition_info_get(uint32_t w1, uint32_t w2, uint32_t w3,
     if ( w5 )
         return FFA_RET_INVALID_PARAMETERS;
 
-    if ( !spin_trylock(&ctx->rx_lock) )
-        return FFA_RET_BUSY;
+    ret = ffa_rx_acquire(d);
+    if ( ret != FFA_RET_OK )
+        goto out;
 
     /*
      * If the guest is v1.0, he does not get back the entry size so we must
@@ -112,10 +113,7 @@ int32_t ffa_handle_partition_info_get(uint32_t w1, uint32_t w2, uint32_t w3,
         ret = FFA_RET_DENIED;
 
         if ( !ffa_rx )
-            goto out;
-
-        if ( !ctx->page_count || !ctx->rx_is_free )
-            goto out;
+            goto out_rx_release;
 
         spin_lock(&ffa_rx_buffer_lock);
 
@@ -123,11 +121,11 @@ int32_t ffa_handle_partition_info_get(uint32_t w1, uint32_t w2, uint32_t w3,
                                      &src_size);
 
         if ( ret )
-            goto out_rx_buf_unlock;
+            goto out_rx_hyp_unlock;
 
         /*
          * ffa_partition_info_get() succeeded so we now own the RX buffer we
-         * share with the SPMC. We must give it back using ffa_rx_release()
+         * share with the SPMC. We must give it back using ffa_hyp_rx_release()
          * once we've copied the content.
          */
 
@@ -135,7 +133,7 @@ int32_t ffa_handle_partition_info_get(uint32_t w1, uint32_t w2, uint32_t w3,
         if ( src_size < sizeof(struct ffa_partition_info_1_0) )
         {
             ret = FFA_RET_NOT_SUPPORTED;
-            goto out_rx_release;
+            goto out_rx_hyp_release;
         }
     }
     else
@@ -149,7 +147,7 @@ int32_t ffa_handle_partition_info_get(uint32_t w1, uint32_t w2, uint32_t w3,
     if ( ctx->page_count * FFA_PAGE_SIZE < num_ffa_sp * dst_size )
     {
         ret = FFA_RET_NO_MEMORY;
-        goto out_rx_release;
+        goto out_rx_hyp_release;
     }
 
     if ( num_ffa_sp > 0 )
@@ -178,17 +176,17 @@ int32_t ffa_handle_partition_info_get(uint32_t w1, uint32_t w2, uint32_t w3,
         }
     }
 
-    ctx->rx_is_free = false;
     *count = num_ffa_sp;
     *size = dst_size;
 
-out_rx_release:
-    ffa_rx_release();
-out_rx_buf_unlock:
+out_rx_hyp_release:
+    ffa_hyp_rx_release();
+out_rx_hyp_unlock:
     spin_unlock(&ffa_rx_buffer_lock);
+out_rx_release:
+    if ( ret != FFA_RET_OK )
+        ffa_rx_release(d);
 out:
-    spin_unlock(&ctx->rx_lock);
-
     return ret;
 }
 
@@ -353,7 +351,7 @@ bool ffa_partinfo_init(void)
     ret = init_subscribers(count, fpi_size);
 
 out:
-    ffa_rx_release();
+    ffa_hyp_rx_release();
     return ret;
 }
 
