@@ -162,6 +162,7 @@ static void handle_features(struct cpu_user_regs *regs)
     case FFA_PARTITION_INFO_GET:
     case FFA_MSG_SEND_DIRECT_REQ_32:
     case FFA_MSG_SEND_DIRECT_REQ_64:
+    case FFA_MSG_SEND2:
         ffa_set_regs_success(regs, 0, 0);
         break;
     case FFA_RXTX_MAP_64:
@@ -252,6 +253,13 @@ static bool ffa_handle_call(struct cpu_user_regs *regs)
     case FFA_MSG_SEND_DIRECT_REQ_32:
     case FFA_MSG_SEND_DIRECT_REQ_64:
         ffa_handle_msg_send_direct_req(regs, fid);
+        return true;
+    case FFA_MSG_SEND2:
+        e = ffa_handle_msg_send2(regs);
+        if ( e )
+            ffa_set_regs_error(regs, e);
+        else
+            ffa_set_regs_success(regs, 0, 0);
         return true;
     case FFA_MEM_SHARE_32:
     case FFA_MEM_SHARE_64:

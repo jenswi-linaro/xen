@@ -271,7 +271,8 @@
                               | FEAT_FUNC_TO_BIT(FFA_RXTX_UNMAP) \
                               | FEAT_FUNC_TO_BIT(FFA_MEM_SHARE_32) \
                               | FEAT_FUNC_TO_BIT(FFA_MEM_RECLAIM) \
-                              | FEAT_FUNC_TO_BIT(FFA_MSG_SEND_DIRECT_REQ_32))
+                              | FEAT_FUNC_TO_BIT(FFA_MSG_SEND_DIRECT_REQ_32) \
+                              | FEAT_FUNC_TO_BIT(FFA_MSG_SEND2))
 
 #define FEAT64_FW_NEEDED     (FEAT_FUNC_TO_BIT(FFA_RXTX_MAP_64) \
                               | FEAT_FUNC_TO_BIT(FFA_MEM_SHARE_64) \
@@ -376,6 +377,7 @@ void ffa_handle_notification_get(struct cpu_user_regs *regs);
 void ffa_handle_notification_set(struct cpu_user_regs *regs);
 
 void ffa_handle_msg_send_direct_req(struct cpu_user_regs *regs, uint32_t fid);
+int32_t ffa_handle_msg_send2(struct cpu_user_regs *regs);
 
 static inline uint16_t ffa_get_vm_id(const struct domain *d)
 {
