@@ -61,12 +61,15 @@ static int32_t ffa_partition_info_get(uint32_t w1, uint32_t w2, uint32_t w3,
 }
 
 int32_t ffa_handle_partition_info_get(uint32_t w1, uint32_t w2, uint32_t w3,
-                                      uint32_t w4, uint32_t w5, uint32_t *count,
-                                      uint32_t *fpi_size)
+                                      uint32_t w4, uint32_t w5,
+                                      uint32_t *count, uint32_t *size)
 {
-    int32_t ret = FFA_RET_DENIED;
+    int32_t ret;
     struct domain *d = current->domain;
     struct ffa_ctx *ctx = d->arch.tee;
+    uint32_t src_size, dst_size;
+    void *dst_buf;
+    uint32_t num_ffa_sp;
 
     /*
      * FF-A v1.0 has w5 MBZ while v1.1 allows
@@ -78,79 +81,95 @@ int32_t ffa_handle_partition_info_get(uint32_t w1, uint32_t w2, uint32_t w3,
     if ( w5 == FFA_PARTITION_INFO_GET_COUNT_FLAG &&
          ctx->guest_vers == FFA_VERSION_1_1 )
     {
+        ret = FFA_RET_OK;
+        *count = 0;
+
         if ( ffa_fw_support_fid(FFA_PARTITION_INFO_GET) )
-            return ffa_partition_info_get(w1, w2, w3, w4, w5, count, fpi_size);
-        else
-        {
-            *count = 0;
-            return FFA_RET_OK;
-        }
+            ret = ffa_partition_info_get(w1, w2, w3, w4, w5, count, size);
+
+        return ret;
     }
     if ( w5 )
         return FFA_RET_INVALID_PARAMETERS;
 
-    if ( !ffa_rx )
-        return FFA_RET_DENIED;
-
     if ( !spin_trylock(&ctx->rx_lock) )
         return FFA_RET_BUSY;
 
-    if ( !ffa_fw_support_fid(FFA_PARTITION_INFO_GET) )
-    {
-        if ( ctx->guest_vers == FFA_VERSION_1_0 )
-            *fpi_size = sizeof(struct ffa_partition_info_1_0);
-        else
-            *fpi_size = sizeof(struct ffa_partition_info_1_1);
-
-        *count = 0;
-        ret = FFA_RET_OK;
-        goto out;
-    }
-
-    if ( !ctx->page_count || !ctx->rx_is_free )
-        goto out;
-    spin_lock(&ffa_rx_buffer_lock);
-    ret = ffa_partition_info_get(w1, w2, w3, w4, w5, count, fpi_size);
-    if ( ret )
-        goto out_rx_buf_unlock;
     /*
-     * ffa_partition_info_get() succeeded so we now own the RX buffer we
-     * share with the SPMC. We must give it back using ffa_rx_release()
-     * once we've copied the content.
+     * If the guest is v1.0, he does not get back the entry size so we must
+     * use the v1.0 structure size in the destination buffer.
+     * Otherwise use the size of the highest version we support, here 1.1.
      */
-
     if ( ctx->guest_vers == FFA_VERSION_1_0 )
+        dst_size = sizeof(struct ffa_partition_info_1_0);
+    else
+        dst_size = sizeof(struct ffa_partition_info_1_1);
+
+    dst_buf = ctx->rx;
+
+    if ( ffa_fw_support_fid(FFA_PARTITION_INFO_GET) )
     {
-        size_t n;
-        struct ffa_partition_info_1_1 *src = ffa_rx;
-        struct ffa_partition_info_1_0 *dst = ctx->rx;
+        ret = FFA_RET_DENIED;
 
-        if ( ctx->page_count * FFA_PAGE_SIZE < *count * sizeof(*dst) )
+        if ( !ffa_rx )
+            goto out;
+
+        if ( !ctx->page_count || !ctx->rx_is_free )
+            goto out;
+
+        spin_lock(&ffa_rx_buffer_lock);
+
+        ret = ffa_partition_info_get(w1, w2, w3, w4, w5, &num_ffa_sp,
+                                     &src_size);
+
+        if ( ret )
+            goto out_rx_buf_unlock;
+
+        /*
+         * ffa_partition_info_get() succeeded so we now own the RX buffer we
+         * share with the SPMC. We must give it back using ffa_rx_release()
+         * once we've copied the content.
+         */
+
+        /* we cannot have a size lower than 1.0 structure */
+        if ( src_size < sizeof(struct ffa_partition_info_1_0) )
         {
-            ret = FFA_RET_NO_MEMORY;
+            ret = FFA_RET_NOT_SUPPORTED;
             goto out_rx_release;
-        }
-
-        for ( n = 0; n < *count; n++ )
-        {
-            dst[n].id = src[n].id;
-            dst[n].execution_context = src[n].execution_context;
-            dst[n].partition_properties = src[n].partition_properties;
         }
     }
     else
     {
-        size_t sz = *count * *fpi_size;
-
-        if ( ctx->page_count * FFA_PAGE_SIZE < sz )
-        {
-            ret = FFA_RET_NO_MEMORY;
-            goto out_rx_release;
-        }
-
-        memcpy(ctx->rx, ffa_rx, sz);
+        ret = FFA_RET_OK;
+        *count = 0;
+        *size = dst_size;
+        goto out;
     }
+
+    if ( ctx->page_count * FFA_PAGE_SIZE < num_ffa_sp * dst_size )
+    {
+        ret = FFA_RET_NO_MEMORY;
+        goto out_rx_release;
+    }
+
+    if ( num_ffa_sp > 0 )
+    {
+        uint32_t n;
+        void *src_buf = ffa_rx;
+
+        /* copy the secure partitions info */
+        for ( n = 0; n < num_ffa_sp; n++ )
+        {
+            memcpy(dst_buf, src_buf, dst_size);
+            dst_buf += dst_size;
+            src_buf += src_size;
+        }
+    }
+
     ctx->rx_is_free = false;
+    *count = num_ffa_sp;
+    *size = dst_size;
+
 out_rx_release:
     ffa_rx_release();
 out_rx_buf_unlock:
@@ -223,19 +242,28 @@ static void uninit_subscribers(void)
             XFREE(subscr_vm_destroyed);
 }
 
-static bool init_subscribers(struct ffa_partition_info_1_1 *fpi, uint16_t count)
+static bool init_subscribers(uint16_t count, uint32_t fpi_size)
 {
     uint16_t n;
     uint16_t c_pos;
     uint16_t d_pos;
+    struct ffa_partition_info_1_1 *fpi;
+
+    if ( fpi_size < sizeof(struct ffa_partition_info_1_1) )
+    {
+        printk(XENLOG_ERR "ffa: partition info size invalid: %u\n", fpi_size);
+        return false;
+    }
 
     subscr_vm_created_count = 0;
     subscr_vm_destroyed_count = 0;
     for ( n = 0; n < count; n++ )
     {
-        if ( fpi[n].partition_properties & FFA_PART_PROP_NOTIF_CREATED )
+        fpi = ffa_rx + n*fpi_size;
+
+        if ( fpi->partition_properties & FFA_PART_PROP_NOTIF_CREATED )
             subscr_vm_created_count++;
-        if ( fpi[n].partition_properties & FFA_PART_PROP_NOTIF_DESTROYED )
+        if ( fpi->partition_properties & FFA_PART_PROP_NOTIF_DESTROYED )
             subscr_vm_destroyed_count++;
     }
 
@@ -254,10 +282,12 @@ static bool init_subscribers(struct ffa_partition_info_1_1 *fpi, uint16_t count)
 
     for ( c_pos = 0, d_pos = 0, n = 0; n < count; n++ )
     {
-        if ( fpi[n].partition_properties & FFA_PART_PROP_NOTIF_CREATED )
-            subscr_vm_created[c_pos++] = fpi[n].id;
-        if ( fpi[n].partition_properties & FFA_PART_PROP_NOTIF_DESTROYED )
-            subscr_vm_destroyed[d_pos++] = fpi[n].id;
+        fpi = ffa_rx + n*fpi_size;
+
+        if ( fpi->partition_properties & FFA_PART_PROP_NOTIF_CREATED )
+            subscr_vm_created[c_pos++] = fpi->id;
+        if ( fpi->partition_properties & FFA_PART_PROP_NOTIF_DESTROYED )
+            subscr_vm_destroyed[d_pos++] = fpi->id;
     }
 
     return true;
@@ -290,7 +320,7 @@ bool ffa_partinfo_init(void)
         goto out;
     }
 
-    ret = init_subscribers(ffa_rx, count);
+    ret = init_subscribers(count, fpi_size);
 
 out:
     ffa_rx_release();
