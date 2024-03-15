@@ -90,30 +90,23 @@ out:
 
 int32_t ffa_handle_msg_send2(struct cpu_user_regs *regs)
 {
-    struct domain *src_d = current->domain;
-    struct ffa_ctx *src_ctx = src_d->arch.tee;
+    struct domain *dst_d, *src_d = current->domain;
+    struct ffa_ctx *dst_ctx, *src_ctx = src_d->arch.tee;
     const struct ffa_part_msg_rxtx *src_msg;
+    struct ffa_part_msg_rxtx *dst_msg;
     int32_t ret;
-
-    if ( !ffa_fw_support_fid(FFA_MSG_SEND2) )
-    {
-        ret = FFA_RET_NOT_SUPPORTED;
-        goto out;
-    }
 
     if ( !spin_trylock(&src_ctx->tx_lock) )
     {
-        ret = FFA_RET_BUSY;
-        goto out;
+        return FFA_RET_BUSY;
     }
 
     src_msg = src_ctx->tx;
 
-    if ( (src_msg->send_recv_id >> 16) != ffa_get_vm_id(src_d) ||
-            !FFA_ID_IS_SECURE(src_msg->send_recv_id & GENMASK(15,0)) )
+    if ( (src_msg->send_recv_id >> 16) != ffa_get_vm_id(src_d) )
     {
         ret = FFA_RET_INVALID_PARAMETERS;
-        goto out_unlock_tx;
+        goto out;
     }
 
     /* check source message fits in buffer */
@@ -122,13 +115,76 @@ int32_t ffa_handle_msg_send2(struct cpu_user_regs *regs)
          src_msg->msg_offset < sizeof(struct ffa_part_msg_rxtx) )
     {
         ret = FFA_RET_INVALID_PARAMETERS;
-        goto out_unlock_tx;
+        goto out;
     }
 
-    ret = ffa_simple_call(FFA_MSG_SEND2, ffa_get_vm_id(src_d) << 16, 0, 0, 0);
+    if ( FFA_ID_IS_SECURE(src_msg->send_recv_id & GENMASK(15,0)) )
+    {
+        /* Message for a secure partition */
+        if ( !ffa_fw_support_fid(FFA_MSG_SEND2) )
+        {
+            ret = FFA_RET_NOT_SUPPORTED;
+            goto out;
+        }
 
-out_unlock_tx:
-    spin_unlock(&src_ctx->tx_lock);
+        ret = ffa_simple_call(FFA_MSG_SEND2, ffa_get_vm_id(src_d) << 16, 0, 0,
+                              0);
+
+        goto out;
+    }
+
+    /* Message for a VM */
+    if ( (src_msg->send_recv_id & GENMASK(15,0)) == 0 )
+    {
+        /* FF-A ID 0 is the hypervisor, this is not valid */
+        ret = FFA_RET_INVALID_PARAMETERS;
+        goto out;
+    }
+
+    dst_d = ffa_get_domain_by_vm_id(src_msg->send_recv_id & GENMASK(15,0));
+    if ( dst_d == NULL || dst_d->arch.tee == NULL )
+    {
+        ret = FFA_RET_INVALID_PARAMETERS;
+        goto out;
+    }
+
+    dst_ctx = dst_d->arch.tee;
+    if ( !dst_ctx->guest_vers )
+    {
+        ret = FFA_RET_INVALID_PARAMETERS;
+        goto out;
+    }
+
+    /* This also checks that destination has set a Rx buffer */
+    ret = ffa_rx_acquire(dst_d);
+    if ( !ret )
+        goto out;
+
+    /* we need to have enough space in the destination buffer */
+    if ( dst_ctx->page_count * FFA_PAGE_SIZE <
+            (sizeof(struct ffa_part_msg_rxtx) + src_msg->msg_size) )
+    {
+        ret = FFA_RET_NO_MEMORY;
+        ffa_rx_release(dst_d);
+        goto out;
+    }
+
+    dst_msg = dst_ctx->rx;
+
+    /* prepare destination header */
+    dst_msg->flags = 0;
+    dst_msg->reserved = 0;
+    dst_msg->msg_offset = sizeof(struct ffa_part_msg_rxtx);
+    dst_msg->send_recv_id = src_msg->send_recv_id;
+    dst_msg->msg_size = src_msg->msg_size;
+
+    memcpy(dst_ctx->rx + sizeof(struct ffa_part_msg_rxtx),
+           src_ctx->tx + src_msg->msg_offset, src_msg->msg_size);
+
+    /* TODO: We need to signal the buffer full to the destination */
+
+    /* receiver rx buffer will be released by the receiver*/
 out:
+    spin_unlock(&src_ctx->tx_lock);
     return ret;
 }
