@@ -65,11 +65,22 @@ int32_t ffa_handle_partition_info_get(uint32_t w1, uint32_t w2, uint32_t w3,
                                       uint32_t *count, uint32_t *size)
 {
     int32_t ret;
-    struct domain *d = current->domain;
+    struct domain *dom, *d = current->domain;
     struct ffa_ctx *ctx = d->arch.tee;
     uint32_t src_size, dst_size;
     void *dst_buf;
-    uint32_t num_ffa_sp;
+    uint32_t num_ffa_vm = 0, num_ffa_sp;
+
+    /* Count the number of VM with FF-A support */
+    rcu_read_lock(&domlist_read_lock);
+    for_each_domain( dom )
+    {
+        struct ffa_ctx *vm = dom->arch.tee;
+
+        if (dom != d && vm != NULL && vm->guest_vers != 0)
+            num_ffa_vm++;
+    }
+    rcu_read_unlock(&domlist_read_lock);
 
     /*
      * FF-A v1.0 has w5 MBZ while v1.1 allows
@@ -86,6 +97,9 @@ int32_t ffa_handle_partition_info_get(uint32_t w1, uint32_t w2, uint32_t w3,
 
         if ( ffa_fw_support_fid(FFA_PARTITION_INFO_GET) )
             ret = ffa_partition_info_get(w1, w2, w3, w4, w5, count, size);
+
+        if ( ret == FFA_RET_OK )
+            *count += num_ffa_vm;
 
         return ret;
     }
@@ -110,10 +124,11 @@ int32_t ffa_handle_partition_info_get(uint32_t w1, uint32_t w2, uint32_t w3,
 
     if ( ffa_fw_support_fid(FFA_PARTITION_INFO_GET) )
     {
-        ret = FFA_RET_DENIED;
-
         if ( !ffa_rx )
+        {
+            ret = FFA_RET_DENIED;
             goto out_rx_release;
+        }
 
         spin_lock(&ffa_rx_buffer_lock);
 
@@ -138,16 +153,18 @@ int32_t ffa_handle_partition_info_get(uint32_t w1, uint32_t w2, uint32_t w3,
     }
     else
     {
-        ret = FFA_RET_OK;
-        *count = 0;
-        *size = dst_size;
-        goto out;
+        src_size = sizeof(struct ffa_partition_info_1_1);
+        num_ffa_sp = 0;
     }
 
-    if ( ctx->page_count * FFA_PAGE_SIZE < num_ffa_sp * dst_size )
+    if ( ctx->page_count * FFA_PAGE_SIZE <
+         (num_ffa_sp + num_ffa_vm) * dst_size )
     {
         ret = FFA_RET_NO_MEMORY;
-        goto out_rx_hyp_release;
+        if ( ffa_fw_support_fid(FFA_PARTITION_INFO_GET) )
+            goto out_rx_hyp_release;
+        else
+            goto out;
     }
 
     if ( num_ffa_sp > 0 )
@@ -176,8 +193,74 @@ int32_t ffa_handle_partition_info_get(uint32_t w1, uint32_t w2, uint32_t w3,
         }
     }
 
-    *count = num_ffa_sp;
+    if ( ffa_fw_support_fid(FFA_PARTITION_INFO_GET) )
+    {
+        ffa_hyp_rx_release();
+        spin_unlock(&ffa_rx_buffer_lock);
+    }
+
+    *count = num_ffa_sp + num_ffa_vm;
     *size = dst_size;
+
+    /* add the VM informations if any */
+    if ( !num_ffa_vm )
+        return FFA_RET_OK;
+
+    rcu_read_lock(&domlist_read_lock);
+    for_each_domain( dom )
+    {
+        struct ffa_ctx *vm = dom->arch.tee;
+
+        /*
+         * we do not add the VM calling to the list and only VMs with
+         * FF-A support
+         */
+        if (dom != d && vm != NULL && vm->guest_vers != 0)
+        {
+            /*
+             * We do not have UUID info for VMs so use
+             * the 1.0 structure so that we set UUIDs to
+             * zero using memset
+             */
+            struct ffa_partition_info_1_0 srcvm;
+
+            if ( !num_ffa_vm )
+            {
+                /*
+                 * The number of domains changed since we counted them, we
+                 * can add new ones if there is enough space in the destination
+                 * buffer so check it or go out with an error.
+                 */
+                (*count)++;
+                if ( ctx->page_count * FFA_PAGE_SIZE < *count * dst_size )
+                {
+                    ret = FFA_RET_NO_MEMORY;
+                    rcu_read_unlock(&domlist_read_lock);
+                    goto out;
+                }
+                num_ffa_vm++;
+            }
+
+            srcvm.id = ffa_get_vm_id(dom);
+            srcvm.execution_context = dom->max_vcpus;
+            srcvm.partition_properties = FFA_PART_VM_PROP;
+            if ( is_64bit_domain(dom) )
+                srcvm.partition_properties |= FFA_PART_PROP_AARCH64_STATE;
+
+            memcpy(dst_buf, &srcvm, MIN(sizeof(srcvm), dst_size));
+
+            if ( dst_size > sizeof(srcvm) )
+                memset(dst_buf + sizeof(srcvm), 0,
+                       dst_size - sizeof(srcvm));
+
+            dst_buf += dst_size;
+
+            num_ffa_vm--;
+        }
+    }
+    rcu_read_unlock(&domlist_read_lock);
+
+    return FFA_RET_OK;
 
 out_rx_hyp_release:
     ffa_hyp_rx_release();
