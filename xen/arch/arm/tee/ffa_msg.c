@@ -181,7 +181,7 @@ int32_t ffa_handle_msg_send2(struct cpu_user_regs *regs)
     memcpy(dst_ctx->rx + sizeof(struct ffa_part_msg_rxtx),
            src_ctx->tx + src_msg->msg_offset, src_msg->msg_size);
 
-    /* TODO: We need to signal the buffer full to the destination */
+    ffa_raise_rx_buffer_full(dst_d);
 
     /* receiver rx buffer will be released by the receiver*/
 out:

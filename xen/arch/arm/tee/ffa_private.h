@@ -208,6 +208,8 @@
 #define FFA_NOTIF_INFO_GET_ID_COUNT_SHIFT   7
 #define FFA_NOTIF_INFO_GET_ID_COUNT_MASK    0x1F
 
+#define FFA_NOTIF_RX_BUFFER_FULL        BIT(0, U)
+
 /* Feature IDs used with FFA_FEATURES */
 #define FFA_FEATURE_NOTIF_PEND_INTR     0x1U
 #define FFA_FEATURE_SCHEDULE_RECV_INTR  0x2U
@@ -316,6 +318,11 @@ struct ffa_ctx_notif {
      * pending global notifications.
      */
     bool spm_pending;
+
+    /*
+     * Pending Hypervisor framework notifications
+     */
+    uint32_t hyp_pending;
 };
 struct ffa_ctx {
     void *rx;
@@ -387,6 +394,8 @@ void ffa_handle_notification_unbind(struct cpu_user_regs *regs);
 void ffa_handle_notification_info_get(struct cpu_user_regs *regs);
 void ffa_handle_notification_get(struct cpu_user_regs *regs);
 void ffa_handle_notification_set(struct cpu_user_regs *regs);
+
+void ffa_raise_rx_buffer_full(struct domain *d);
 
 void ffa_handle_msg_send_direct_req(struct cpu_user_regs *regs, uint32_t fid);
 int32_t ffa_handle_msg_send2(struct cpu_user_regs *regs);
