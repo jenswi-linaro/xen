@@ -65,8 +65,11 @@
 
 #include "ffa_private.h"
 
-/* Negotiated FF-A version to use with the SPMC */
-static uint32_t __ro_after_init ffa_version;
+/* Negotiated FF-A version to use with the SPMC, 0 if not there or supported */
+static uint32_t __ro_after_init ffa_fw_version;
+/* Features supported by the SPMC or secure world when present, 0 otherwise */
+uint64_t ffa_fw_feat32_supported;
+uint64_t ffa_fw_feat64_supported;
 
 
 
@@ -100,30 +103,16 @@ static bool ffa_get_version(uint32_t *vers)
 
     arm_smccc_1_2_smc(&arg, &resp);
     if ( resp.a0 == FFA_RET_NOT_SUPPORTED )
-    {
-        gprintk(XENLOG_ERR, "ffa: FFA_VERSION returned not supported\n");
         return false;
-    }
 
     *vers = resp.a0;
 
     return true;
 }
 
-static int32_t ffa_features(uint32_t id)
+static int32_t ffa_feature_supported(uint32_t id)
 {
-    return ffa_simple_call(FFA_FEATURES, id, 0, 0, 0);
-}
-
-static bool check_mandatory_feature(uint32_t id)
-{
-    int32_t ret = ffa_features(id);
-
-    if ( ret )
-        printk(XENLOG_ERR "ffa: mandatory feature id %#x missing: error %d\n",
-               id, ret);
-
-    return !ret;
+    return !ffa_simple_call(FFA_FEATURES, id, 0, 0, 0);
 }
 
 static void handle_version(struct cpu_user_regs *regs)
@@ -139,58 +128,6 @@ static void handle_version(struct cpu_user_regs *regs)
 
     ctx->guest_vers = vers;
     ffa_set_regs(regs, vers, 0, 0, 0, 0, 0, 0, 0);
-}
-
-static void handle_msg_send_direct_req(struct cpu_user_regs *regs, uint32_t fid)
-{
-    struct arm_smccc_1_2_regs arg = { .a0 = fid, };
-    struct arm_smccc_1_2_regs resp = { };
-    struct domain *d = current->domain;
-    uint32_t src_dst;
-    uint64_t mask;
-
-    if ( smccc_is_conv_64(fid) )
-        mask = GENMASK_ULL(63, 0);
-    else
-        mask = GENMASK_ULL(31, 0);
-
-    src_dst = get_user_reg(regs, 1);
-    if ( (src_dst >> 16) != ffa_get_vm_id(d) )
-    {
-        resp.a0 = FFA_ERROR;
-        resp.a2 = FFA_RET_INVALID_PARAMETERS;
-        goto out;
-    }
-
-    arg.a1 = src_dst;
-    arg.a2 = get_user_reg(regs, 2) & mask;
-    arg.a3 = get_user_reg(regs, 3) & mask;
-    arg.a4 = get_user_reg(regs, 4) & mask;
-    arg.a5 = get_user_reg(regs, 5) & mask;
-    arg.a6 = get_user_reg(regs, 6) & mask;
-    arg.a7 = get_user_reg(regs, 7) & mask;
-
-    arm_smccc_1_2_smc(&arg, &resp);
-    switch ( resp.a0 )
-    {
-    case FFA_ERROR:
-    case FFA_SUCCESS_32:
-    case FFA_SUCCESS_64:
-    case FFA_MSG_SEND_DIRECT_RESP_32:
-    case FFA_MSG_SEND_DIRECT_RESP_64:
-        break;
-    default:
-        /* Bad fid, report back to the caller. */
-        memset(&resp, 0, sizeof(resp));
-        resp.a0 = FFA_ERROR;
-        resp.a1 = src_dst;
-        resp.a2 = FFA_RET_ABORTED;
-    }
-
-out:
-    ffa_set_regs(regs, resp.a0, resp.a1 & mask, resp.a2 & mask, resp.a3 & mask,
-                 resp.a4 & mask, resp.a5 & mask, resp.a6 & mask,
-                 resp.a7 & mask);
 }
 
 static void handle_features(struct cpu_user_regs *regs)
@@ -225,6 +162,7 @@ static void handle_features(struct cpu_user_regs *regs)
     case FFA_PARTITION_INFO_GET:
     case FFA_MSG_SEND_DIRECT_REQ_32:
     case FFA_MSG_SEND_DIRECT_REQ_64:
+    case FFA_MSG_SEND2:
         ffa_set_regs_success(regs, 0, 0);
         break;
     case FFA_RXTX_MAP_64:
@@ -306,7 +244,7 @@ static bool ffa_handle_call(struct cpu_user_regs *regs)
             ffa_set_regs_success(regs, count, fpi_size);
         return true;
     case FFA_RX_RELEASE:
-        e = ffa_handle_rx_release();
+        e = ffa_rx_release(d);
         if ( e )
             ffa_set_regs_error(regs, e);
         else
@@ -314,7 +252,14 @@ static bool ffa_handle_call(struct cpu_user_regs *regs)
         return true;
     case FFA_MSG_SEND_DIRECT_REQ_32:
     case FFA_MSG_SEND_DIRECT_REQ_64:
-        handle_msg_send_direct_req(regs, fid);
+        ffa_handle_msg_send_direct_req(regs, fid);
+        return true;
+    case FFA_MSG_SEND2:
+        e = ffa_handle_msg_send2(regs);
+        if ( e )
+            ffa_set_regs_error(regs, e);
+        else
+            ffa_set_regs_success(regs, 0, 0);
         return true;
     case FFA_MEM_SHARE_32:
     case FFA_MEM_SHARE_64:
@@ -357,13 +302,15 @@ static int ffa_domain_init(struct domain *d)
 {
     struct ffa_ctx *ctx;
 
-    if ( !ffa_version )
-        return -ENODEV;
-     /*
-      * We can't use that last possible domain ID or ffa_get_vm_id() would
-      * cause an overflow.
-      */
-    if ( d->domain_id >= UINT16_MAX)
+    /*
+     * We are using the domain_id + 1 as the FF-A ID for VMs as FF-A ID 0 is
+     * reserved for the hypervisor and we only support secure endpoints using
+     * FF-A IDs with BIT 15 set to 1 so make sure those are not used by Xen.
+     */
+    BUILD_BUG_ON(DOMID_FIRST_RESERVED >= UINT16_MAX);
+    BUILD_BUG_ON((DOMID_MASK & BIT(15, U)) != 0);
+
+    if ( d->domain_id >= DOMID_FIRST_RESERVED )
         return -ERANGE;
 
     ctx = xzalloc(struct ffa_ctx);
@@ -484,6 +431,9 @@ static bool ffa_probe(void)
      */
     BUILD_BUG_ON(PAGE_SIZE != FFA_PAGE_SIZE);
 
+    printk(XENLOG_INFO "ARM FF-A Mediator version %u.%u\n",
+           FFA_MY_VERSION_MAJOR, FFA_MY_VERSION_MINOR);
+
     /*
      * psci_init_smccc() updates this value with what's reported by EL-3
      * or secure world.
@@ -493,59 +443,74 @@ static bool ffa_probe(void)
         printk(XENLOG_ERR
                "ffa: unsupported SMCCC version %#x (need at least %#x)\n",
                smccc_ver, ARM_SMCCC_VERSION_1_2);
-        return false;
     }
-
-    if ( !ffa_get_version(&vers) )
-        return false;
-
-    if ( vers < FFA_MIN_SPMC_VERSION || vers > FFA_MY_VERSION )
+    else if ( !ffa_get_version(&vers) )
+    {
+        gprintk(XENLOG_ERR, "ffa: FFA_VERSION returned not supported\n");
+    }
+    else if ( vers < FFA_MIN_SPMC_VERSION || vers > FFA_MY_VERSION )
     {
         printk(XENLOG_ERR "ffa: Incompatible version %#x found\n", vers);
-        return false;
+    }
+    else
+    {
+        uint32_t featnum;
+
+        major_vers = (vers >> FFA_VERSION_MAJOR_SHIFT)
+                     & FFA_VERSION_MAJOR_MASK;
+        minor_vers = vers & FFA_VERSION_MINOR_MASK;
+        printk(XENLOG_INFO "ARM FF-A Firmware version %u.%u\n",
+               major_vers, minor_vers);
+
+        ffa_fw_version = vers;
+
+        for (featnum = 0; featnum < 64; featnum++)
+        {
+            if ( (FEAT32_FW_NEEDED & (1ULL<<featnum)) )
+            {
+                if ( ffa_feature_supported(FEAT32_TO_FID(featnum)) )
+                    ffa_fw_feat32_supported |= 1ULL<<featnum;
+                else
+                    printk(XENLOG_INFO "ARM FF-A Firmware does not support 0x%08x\n",
+                           FEAT32_TO_FID(featnum));
+            }
+            if ( (FEAT64_FW_NEEDED & (1ULL<<featnum)) )
+            {
+                if ( ffa_feature_supported(FEAT64_TO_FID(featnum)) )
+                    ffa_fw_feat64_supported |= 1ULL<<featnum;
+                else
+                    printk(XENLOG_INFO "ARM FF-A Firmware does not support 0x%08x\n",
+                           FEAT64_TO_FID(featnum));
+            }
+        }
     }
 
-    major_vers = (vers >> FFA_VERSION_MAJOR_SHIFT) & FFA_VERSION_MAJOR_MASK;
-    minor_vers = vers & FFA_VERSION_MINOR_MASK;
-    printk(XENLOG_INFO "ARM FF-A Mediator version %u.%u\n",
-           FFA_MY_VERSION_MAJOR, FFA_MY_VERSION_MINOR);
-    printk(XENLOG_INFO "ARM FF-A Firmware version %u.%u\n",
-           major_vers, minor_vers);
-
-    /*
-     * At the moment domains must support the same features used by Xen.
-     * TODO: Rework the code to allow domain to use a subset of the
-     * features supported.
-     */
-    if ( !check_mandatory_feature(FFA_PARTITION_INFO_GET) ||
-         !check_mandatory_feature(FFA_RX_RELEASE) ||
-         !check_mandatory_feature(FFA_RXTX_MAP_64) ||
-         !check_mandatory_feature(FFA_MEM_SHARE_64) ||
-         !check_mandatory_feature(FFA_RXTX_UNMAP) ||
-         !check_mandatory_feature(FFA_MEM_SHARE_32) ||
-         !check_mandatory_feature(FFA_MEM_RECLAIM) ||
-         !check_mandatory_feature(FFA_MSG_SEND_DIRECT_REQ_32) )
-        return false;
-
-    if ( !ffa_rxtx_init() )
-        return false;
-
-    ffa_version = vers;
-
-    if ( !ffa_partinfo_init() )
-        goto err_rxtx_uninit;
-
-    ffa_notif_init();
     INIT_LIST_HEAD(&ffa_teardown_head);
     init_timer(&ffa_teardown_timer, ffa_teardown_timer_callback, NULL, 0);
 
+    if ( !ffa_fw_version )
+        printk(XENLOG_INFO "ARM FF-A No suitable firmware support\n");
+    else
+    {
+        if ( !ffa_rxtx_init() )
+            goto err_disable_fw;
+
+        if ( !ffa_partinfo_init() )
+            goto err_disable_fw;
+
+        ffa_notif_init();
+    }
+
     return true;
 
-err_rxtx_uninit:
+err_disable_fw:
+    printk(XENLOG_ERR "ARM FFA: Error during firmware init, disabling firmware\n");
     ffa_rxtx_uninit();
-    ffa_version = 0;
+    ffa_fw_version = 0;
+    ffa_fw_feat32_supported = 0;
+    ffa_fw_feat64_supported = 0;
 
-    return false;
+    return true;
 }
 
 static const struct tee_mediator_ops ffa_ops =

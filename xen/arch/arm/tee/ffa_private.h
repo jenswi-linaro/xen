@@ -106,6 +106,13 @@
  */
 #define FFA_CTX_TEARDOWN_DELAY          SECONDS(1)
 
+/*
+ * We rely on the convention suggested but not mandated by the FF-A
+ * specification that secure world endpoint identifiers have the bit 15
+ * set and normal world have it set to 0.
+ */
+#define FFA_ID_IS_SECURE(id)    ((id) & BIT(15, U))
+
 /* FF-A-1.1-REL0 section 10.9.2 Memory region handle, page 167 */
 #define FFA_HANDLE_HYP_FLAG             BIT(63, ULL)
 #define FFA_HANDLE_INVALID              0xffffffffffffffffULL
@@ -178,6 +185,18 @@
  */
 #define FFA_PARTITION_INFO_GET_COUNT_FLAG BIT(0, U)
 
+/*
+ * Partition properties we give for a normal world VM:
+ * - can send direct message but not receive them
+ * - can handle indirect messages
+ * - can receive notifications
+ * 32/64 bit flag is set depending on the VM
+ */
+#define FFA_PART_VM_PROP    (FFA_PART_PROP_DIRECT_REQ_SEND | \
+                             FFA_PART_PROP_INDIRECT_MSGS | \
+                             FFA_PART_PROP_RECV_NOTIF | \
+                             FFA_PART_PROP_IS_PE_ID)
+
 /* Flags used in calls to FFA_NOTIFICATION_GET interface  */
 #define FFA_NOTIF_FLAG_BITMAP_SP        BIT(0, U)
 #define FFA_NOTIF_FLAG_BITMAP_VM        BIT(1, U)
@@ -188,6 +207,8 @@
 #define FFA_NOTIF_INFO_GET_ID_LIST_SHIFT    12
 #define FFA_NOTIF_INFO_GET_ID_COUNT_SHIFT   7
 #define FFA_NOTIF_INFO_GET_ID_COUNT_MASK    0x1F
+
+#define FFA_NOTIF_RX_BUFFER_FULL        BIT(0, U)
 
 /* Feature IDs used with FFA_FEATURES */
 #define FFA_FEATURE_NOTIF_PEND_INTR     0x1U
@@ -240,6 +261,52 @@
 #define FFA_NOTIFICATION_INFO_GET_32    0x84000083U
 #define FFA_NOTIFICATION_INFO_GET_64    0xC4000083U
 
+/**
+ * Encoding of features supported or not by the fw in a 64bit value:
+ * - Function IDs are going from 0x60 to 0x86 so we have a maximum of 38 so
+ *   forsee for up to 63
+ * - We have one set of definitions and variable for 32bit and one for 64bit
+ * We use a 64bit value to encode one bit for each function.
+ * This allows us to have a 64bit value used to encode functions supported
+ * or not which makes it easier to test if a call can be forwarded to the
+ * firmware or not.
+ */
+#define FEAT_FUNC_TO_NUM(id)    (((id) - FFA_ERROR) & 0x3FU)
+#define FEAT_FUNC_TO_BIT(id)    (1ULL<<FEAT_FUNC_TO_NUM(id))
+#define FEAT32_TO_FID(f)        (FFA_ERROR + (f))
+#define FEAT64_TO_FID(f)        (FEAT32_TO_FID(f) | \
+                                 (ARM_SMCCC_CONV_64 << ARM_SMCCC_CONV_SHIFT))
+
+/* List of functions we need from firmware */
+#define FEAT32_FW_NEEDED     (FEAT_FUNC_TO_BIT(FFA_VERSION) \
+                              | FEAT_FUNC_TO_BIT(FFA_FEATURES) \
+                              | FEAT_FUNC_TO_BIT(FFA_PARTITION_INFO_GET) \
+                              | FEAT_FUNC_TO_BIT(FFA_RX_RELEASE) \
+                              | FEAT_FUNC_TO_BIT(FFA_RXTX_UNMAP) \
+                              | FEAT_FUNC_TO_BIT(FFA_MEM_SHARE_32) \
+                              | FEAT_FUNC_TO_BIT(FFA_MEM_RECLAIM) \
+                              | FEAT_FUNC_TO_BIT(FFA_MSG_SEND_DIRECT_REQ_32) \
+                              | FEAT_FUNC_TO_BIT(FFA_MSG_SEND2))
+
+#define FEAT64_FW_NEEDED     (FEAT_FUNC_TO_BIT(FFA_RXTX_MAP_64) \
+                              | FEAT_FUNC_TO_BIT(FFA_MEM_SHARE_64) \
+                              | FEAT_FUNC_TO_BIT(FFA_MSG_SEND_DIRECT_REQ_64))
+
+/* Constituent memory region descriptor */
+struct ffa_address_range {
+    uint64_t address;
+    uint32_t page_count;
+    uint32_t reserved;
+};
+
+/* Composite memory region descriptor */
+struct ffa_mem_region {
+    uint32_t total_page_count;
+    uint32_t address_range_count;
+    uint64_t reserved;
+    struct ffa_address_range address_range_array[];
+};
+
 struct ffa_ctx_notif {
     unsigned int intid;
 
@@ -251,6 +318,11 @@ struct ffa_ctx_notif {
      * pending global notifications.
      */
     bool spm_pending;
+
+    /*
+     * Pending Hypervisor framework notifications
+     */
+    uint32_t hyp_pending;
 };
 struct ffa_ctx {
     void *rx;
@@ -269,7 +341,7 @@ struct ffa_ctx {
     struct ffa_ctx_notif *notif;
     /*
      * tx_lock is used to serialize access to tx
-     * rx_lock is used to serialize access to rx
+     * rx_lock is used to serialize access to rx_is_free
      * lock is used for the rest in this struct
      */
     spinlock_t tx_lock;
@@ -290,6 +362,8 @@ extern void *ffa_rx;
 extern void *ffa_tx;
 extern spinlock_t ffa_rx_buffer_lock;
 extern spinlock_t ffa_tx_buffer_lock;
+extern uint64_t ffa_fw_feat32_supported;
+extern uint64_t ffa_fw_feat64_supported;
 
 bool ffa_shm_domain_destroy(struct domain *d);
 void ffa_handle_mem_share(struct cpu_user_regs *regs);
@@ -308,7 +382,8 @@ void ffa_rxtx_domain_destroy(struct domain *d);
 uint32_t ffa_handle_rxtx_map(uint32_t fid, register_t tx_addr,
 			     register_t rx_addr, uint32_t page_count);
 uint32_t ffa_handle_rxtx_unmap(void);
-int32_t ffa_handle_rx_release(void);
+int32_t ffa_rx_acquire(struct domain *d);
+int32_t ffa_rx_release(struct domain *d);
 
 void ffa_notif_init(void);
 bool ffa_notif_domain_init(struct domain *d);
@@ -320,6 +395,10 @@ void ffa_handle_notification_info_get(struct cpu_user_regs *regs);
 void ffa_handle_notification_get(struct cpu_user_regs *regs);
 void ffa_handle_notification_set(struct cpu_user_regs *regs);
 
+void ffa_raise_rx_buffer_full(struct domain *d);
+
+void ffa_handle_msg_send_direct_req(struct cpu_user_regs *regs, uint32_t fid);
+int32_t ffa_handle_msg_send2(struct cpu_user_regs *regs);
 
 static inline uint16_t ffa_get_vm_id(const struct domain *d)
 {
@@ -395,9 +474,17 @@ static inline int32_t ffa_simple_call(uint32_t fid, register_t a1,
     return ffa_get_ret_code(&resp);
 }
 
-static inline int32_t ffa_rx_release(void)
+static inline int32_t ffa_hyp_rx_release(void)
 {
     return ffa_simple_call(FFA_RX_RELEASE, 0, 0, 0, 0);
+}
+
+static inline bool ffa_fw_support_fid(uint32_t fid)
+{
+    if ( smccc_is_conv_64(fid) )
+        return ((ffa_fw_feat64_supported & FEAT_FUNC_TO_BIT(fid)) != 0);
+    else
+        return ((ffa_fw_feat32_supported & FEAT_FUNC_TO_BIT(fid)) != 0);
 }
 
 #endif /*__FFA_PRIVATE_H__*/

@@ -15,21 +15,6 @@
 
 #include "ffa_private.h"
 
-/* Constituent memory region descriptor */
-struct ffa_address_range {
-    uint64_t address;
-    uint32_t page_count;
-    uint32_t reserved;
-};
-
-/* Composite memory region descriptor */
-struct ffa_mem_region {
-    uint32_t total_page_count;
-    uint32_t address_range_count;
-    uint64_t reserved;
-    struct ffa_address_range address_range_array[];
-};
-
 /* Memory access permissions descriptor */
 struct ffa_mem_access_perm {
     uint16_t endpoint_id;
@@ -148,6 +133,9 @@ static int32_t ffa_mem_share(uint32_t tot_len, uint32_t frag_len,
 static int32_t ffa_mem_reclaim(uint32_t handle_lo, uint32_t handle_hi,
                                uint32_t flags)
 {
+    if ( !ffa_fw_support_fid(FFA_MEM_RECLAIM) )
+        return FFA_RET_NOT_SUPPORTED;
+
     return ffa_simple_call(FFA_MEM_RECLAIM, handle_lo, handle_hi, flags, 0);
 }
 
@@ -466,6 +454,12 @@ void ffa_handle_mem_share(struct cpu_user_regs *regs)
     uint32_t range_count;
     uint32_t region_offs;
 
+    if ( !ffa_fw_support_fid(FFA_MEM_SHARE_64) )
+    {
+        ret = FFA_RET_NOT_SUPPORTED;
+        goto out_set_ret;
+    }
+
     /*
      * We're only accepting memory transaction descriptors via the rx/tx
      * buffer.
@@ -527,6 +521,13 @@ void ffa_handle_mem_share(struct cpu_user_regs *regs)
         goto out_unlock;
 
     mem_access = ctx->tx + trans.mem_access_offs;
+    if ( !FFA_ID_IS_SECURE(read_atomic(&mem_access->access_perm.endpoint_id)) )
+    {
+        /* we do not support sharing with VMs */
+        ret = FFA_RET_NOT_SUPPORTED;
+        goto out_unlock;
+    }
+
     if ( read_atomic(&mem_access->access_perm.perm) != FFA_MEM_ACC_RW )
     {
         ret = FFA_RET_NOT_SUPPORTED;
@@ -625,6 +626,9 @@ int ffa_handle_mem_reclaim(uint64_t handle, uint32_t flags)
     register_t handle_hi;
     register_t handle_lo;
     int ret;
+
+    if ( !ffa_fw_support_fid(FFA_MEM_RECLAIM) )
+        return FFA_RET_NOT_SUPPORTED;
 
     spin_lock(&ctx->lock);
     shm = find_shm_mem(ctx, handle);

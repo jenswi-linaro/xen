@@ -166,6 +166,16 @@ void ffa_handle_notification_get(struct cpu_user_regs *regs)
             w6 = resp.a6;
     }
 
+    if ( flags & FFA_NOTIF_FLAG_BITMAP_HYP )
+    {
+        struct ffa_ctx *ctx = d->arch.tee;
+
+        spin_lock(&ctx->notif->lock);
+        w7 = ctx->notif->hyp_pending;
+        ctx->notif->hyp_pending = 0;
+        spin_unlock(&ctx->notif->lock);
+    }
+
     ffa_set_regs(regs, FFA_SUCCESS_32, 0, w2, w3, w4, w5, w6, w7);
 }
 
@@ -197,6 +207,27 @@ void ffa_handle_notification_set(struct cpu_user_regs *regs)
         ffa_set_regs_error(regs, e);
     else
         ffa_set_regs_success(regs, 0, 0);
+}
+
+void ffa_raise_rx_buffer_full(struct domain *d)
+{
+    struct ffa_ctx *ctx = d->arch.tee;
+    bool raise_irq = false;
+
+    if ( !ctx || !ctx->notif )
+        return;
+
+    spin_lock(&ctx->notif->lock);
+
+    if ( ctx->notif->hyp_pending )
+        raise_irq = false;
+
+    ctx->notif->hyp_pending |= FFA_NOTIF_RX_BUFFER_FULL;
+
+    spin_unlock(&ctx->notif->lock);
+
+    if ( raise_irq )
+        vgic_inject_irq(d, d->vcpu[0], ctx->notif->intid, true);
 }
 
 static uint16_t get_id_from_resp(struct arm_smccc_1_2_regs *resp,
@@ -314,6 +345,11 @@ void ffa_notif_init(void)
     struct arm_smccc_1_2_regs resp;
     unsigned int irq;
     int ret;
+
+    /* Disable notification if bitmap create or destroy is not supported */
+    if ( !ffa_fw_support_fid(FFA_NOTIFICATION_BITMAP_CREATE) ||
+         !ffa_fw_support_fid(FFA_NOTIFICATION_BITMAP_DESTROY) )
+         return;
 
     arm_smccc_1_2_smc(&arg, &resp);
     if ( resp.a0 != FFA_SUCCESS_32 )
