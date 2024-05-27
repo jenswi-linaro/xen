@@ -96,6 +96,12 @@ static int __init tee_init(void)
 
 __initcall(tee_init);
 
+void __init init_tee_interrupt(void)
+{
+    if ( cur_mediator && cur_mediator->ops->init_interrupt)
+        cur_mediator->ops->init_interrupt();
+}
+
 /*
  * Local variables:
  * mode: C
